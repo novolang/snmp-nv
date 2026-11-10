@@ -1,0 +1,330 @@
+// snmpoid.nv — object identifiers: arcs in a fixed array, their text, their
+// order and their BER form, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+//
+// An OBJECT IDENTIFIER is a sequence of non-negative numbers called arcs,
+// written `1.3.6.1.2.1.1.1.0`.  RFC 2578 section 3.5 lets one hold up to
+// 128 arcs, each up to 2^32 - 1.  This package holds `SNMP_OID_MAX` arcs,
+// 24, because an identifier is a value in a frame and 128 arcs would make
+// every variable binding 512 bytes of it.  The tables that agents expose
+// in practice (`ifTable`, `ipRouteTable`, `tcpConnTable`) have instance
+// identifiers of under twenty arcs.  A longer identifier is refused with
+// `SNMP_E_OID_TOO_LONG` when it is read and with false when it is built.
+//
+// ON THE WIRE the first two arcs share one number, `40 * first + second`,
+// and every arc is written base 128 with the top bit set on all but the
+// last octet (X.690 section 8.19, RFC 1155 section 3.2.2.2). The first arc
+// is 0, 1 or 2, and the second is at most 39 under 0 and 1. `asn1tag`
+// holds the packing; this module applies it.
+
+use std.str
+use asn1tag
+use snmpber
+use snmperr
+
+// The most arcs an identifier here holds: 24.
+pub const SNMP_OID_MAX = 24
+
+// An object identifier.
+//
+// The arcs are in order, `arcs.len()` of them.
+pub @value
+struct SnmpOid
+    // The arcs, each 0 to 4294967295.
+    arcs: Vec[u32; SNMP_OID_MAX]
+
+// An identifier with no arcs.
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     println("${o.arcs.len()}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_empty() -> SnmpOid []
+    SnmpOid { arcs: Vec.new() }
+
+// The number of arcs.
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     let _p = snmpoid.oid_parse(var o, "1.3.6.1")
+//     println("${snmpoid.oid_len(var o)}")   // 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_len(var o: SnmpOid) -> Int []
+    o.arcs.len()
+
+// The arc at index `i`, or -1 when there is none.
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     let _p = snmpoid.oid_parse(var o, "1.3.6")
+//     println("${snmpoid.oid_arc(var o, 2)} ${snmpoid.oid_arc(var o, 3)}")   // 6 -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_arc(var o: SnmpOid, i: Int) -> Int []
+    if i < 0 or i >= o.arcs.len()
+        return -1
+    o.arcs[i] as Int
+
+// Append one arc.  Answers false, and changes nothing, when the arc is
+// not from 0 to 4294967295 or the identifier already has `SNMP_OID_MAX`
+// arcs.
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     println("${snmpoid.oid_push(var o, 1)} ${snmpoid.oid_push(var o, -1)}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_push(var o: SnmpOid, arc: Int) -> Bool []
+    if arc < 0 or arc > 4294967295
+        return false
+    match o.arcs.push(arc as u32)
+        Ok(_)  => true
+        Err(_) => false
+
+// Read an identifier from its dotted text, such as `1.3.6.1.2.1.1.1.0` or
+// `.1.3.6.1`, replacing what `o` held.  Answers false, leaving `o` empty,
+// when a part is not a number from 0 to 4294967295, when two dots are
+// together, or when there are more than `SNMP_OID_MAX` arcs.  The empty
+// text is the identifier with no arcs.
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     println("${snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")} ${snmpoid.oid_len(var o)}")   // true 9
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_parse(var o: SnmpOid, text: Str) -> Bool []
+    o.arcs.clear()
+    let n = str.len(text)
+    var ok = true
+    var cur = 0
+    var digits = 0
+    for i in 0..n
+        let c = str.byte_at_or(text, i, 0)
+        if c >= 48 and c <= 57 and digits < 10
+            cur = cur * 10 + (c - 48)
+            digits = digits + 1
+        elif c == 46 and (digits > 0 or i == 0)
+            if digits > 0
+                ok = ok and oid_push(var o, cur)
+            cur = 0
+            digits = 0
+        else
+            ok = false
+    if digits > 0
+        ok = ok and oid_push(var o, cur)
+    elif n > 0
+        ok = false
+    if not ok
+        o.arcs.clear()
+    ok
+
+// Compare two identifiers arc by arc: -1 when `a` sorts before `b`, 0
+// when they are equal and 1 when `a` sorts after.  An identifier that is
+// a prefix of another sorts before it. This is the order GETNEXT walks
+// (RFC 3416 section 4.2.2).
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var a = snmpoid.oid_empty()
+//     var b = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var a, "1.3.6.1")
+//     let _y = snmpoid.oid_parse(var b, "1.3.6.1.2")
+//     println("${snmpoid.oid_compare(var a, var b)}")   // -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_compare(var a: SnmpOid, var b: SnmpOid) -> Int []
+    let n = if a.arcs.len() < b.arcs.len() then a.arcs.len() else b.arcs.len()
+    for i in 0..n
+        let x = a.arcs[i] as Int
+        let y = b.arcs[i] as Int
+        if x < y
+            return -1
+        if x > y
+            return 1
+    if a.arcs.len() < b.arcs.len()
+        return -1
+    if a.arcs.len() > b.arcs.len()
+        return 1
+    0
+
+// Whether `prefix` is the start of `o`, or equal to it.  A walk of a
+// subtree stops at the first identifier for which this is false.
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var a = snmpoid.oid_empty()
+//     var b = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var a, "1.3.6.1")
+//     let _y = snmpoid.oid_parse(var b, "1.3.6.1.2")
+//     println("${snmpoid.oid_is_prefix(var a, var b)}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_is_prefix(var prefix: SnmpOid, var o: SnmpOid) -> Bool []
+    if prefix.arcs.len() > o.arcs.len()
+        return false
+    for i in 0..prefix.arcs.len()
+        if prefix.arcs[i] != o.arcs[i]
+            return false
+    true
+
+// Copy `src` into `dst`, replacing what `dst` held.
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var a = snmpoid.oid_empty()
+//     var b = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var a, "1.3.6.1")
+//     snmpoid.oid_copy(var b, var a)
+//     println("${snmpoid.oid_len(var b)}")   // 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_copy(var dst: SnmpOid, var src: SnmpOid) []
+    dst.arcs.clear()
+    for i in 0..src.arcs.len()
+        let _ok = oid_push(var dst, src.arcs[i] as Int)
+
+// The packed value of the first two arcs, `40 * first + second`, or -1
+// when they cannot be packed: the first arc is over 2, or the second is
+// over 39 under a first arc of 0 or 1, or there are fewer than two.
+@tier(embedded)
+@no_alloc
+fn packed_head(var o: SnmpOid) -> Int []
+    if o.arcs.len() < 2
+        return -1
+    let first = o.arcs[0] as Int
+    let second = o.arcs[1] as Int
+    if first > 2 or (first < 2 and second > 39)
+        return -1
+    asn1tag.pack_arcs(first, second)
+
+// The number of octets the contents of the identifier take on the wire,
+// or -1 when it cannot be encoded.
+//
+// ```novo
+// use snmpoid
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     let _p = snmpoid.oid_parse(var o, "1.3.6.1.4.1.9")
+//     println("${snmpoid.oid_content_len(var o)}")   // 6
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_content_len(var o: SnmpOid) -> Int []
+    let head = packed_head(var o)
+    if head < 0
+        return -1
+    var n = asn1tag.arc_len(head)
+    for i in 2..o.arcs.len()
+        n = n + asn1tag.arc_len(o.arcs[i] as Int)
+    n
+
+// Append the identifier as an OBJECT IDENTIFIER value with the given tag.
+// Answers false when it has fewer than two arcs, cannot be packed, or does
+// not fit.
+//
+// ```novo
+// use snmpber
+// use snmpoid
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     let _p = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var o)} ${b.len()}")   // true 10
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_put(var b: SnmpBuf, tag: Int, var o: SnmpOid) -> Bool []
+    let n = oid_content_len(var o)
+    if n < 0
+        return false
+    var ok = snmpber.put_head(var b, tag, n)
+    let head = asn1tag.emit_arc(packed_head(var o))
+    for i in 0..head.len
+        ok = ok and snmpber.put_byte(var b, head.out[i] as Int)
+    for k in 2..o.arcs.len()
+        let e = asn1tag.emit_arc(o.arcs[k] as Int)
+        for i in 0..e.len
+            ok = ok and snmpber.put_byte(var b, e.out[i] as Int)
+    ok
+
+// Read `len` bytes at `at` as the contents of an OBJECT IDENTIFIER into
+// `o`, replacing what it held.  Answers `SNMP_OK`, or `SNMP_E_BAD_OID`
+// for empty contents, an arc over 2^32 - 1 or an arc that begins with
+// the padding octet 0x80, and `SNMP_E_OID_TOO_LONG` when the identifier
+// has more than `SNMP_OID_MAX` arcs.
+//
+// ```novo
+// use snmpber
+// use snmpoid
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     let _p = snmpoid.oid_parse(var o, "1.3.6.1")
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let _w = snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var o)
+//     var r = snmpoid.oid_empty()
+//     println("${snmpoid.oid_read(var b, 2, 3, var r)} ${snmpoid.oid_len(var r)}")   // 0 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn oid_read(var b: SnmpBuf, at: Int, len: Int, var o: SnmpOid) -> Int []
+    o.arcs.clear()
+    if len < 1 or at < 0 or at + len > b.len()
+        return snmperr.SNMP_E_BAD_OID
+    var s = asn1tag.arc_scan()
+    var first = true
+    var code = snmperr.SNMP_OK
+    for i in 0..len
+        s = asn1tag.arc_push(s, b[at + i])
+        if s.bad
+            code = snmperr.SNMP_E_BAD_OID
+        if s.done and code == snmperr.SNMP_OK
+            if first
+                let a0 = asn1tag.first_arc(s.acc)
+                if not oid_push(var o, a0) or not oid_push(var o, asn1tag.second_arc(s.acc))
+                    code = snmperr.SNMP_E_BAD_OID
+                first = false
+            elif s.acc > 4294967295
+                code = snmperr.SNMP_E_BAD_OID
+            elif not oid_push(var o, s.acc)
+                code = snmperr.SNMP_E_OID_TOO_LONG
+            s = asn1tag.arc_scan()
+    if code == snmperr.SNMP_OK and not s.done and s.seen > 0
+        code = snmperr.SNMP_E_BAD_OID
+    if code != snmperr.SNMP_OK
+        o.arcs.clear()
+    code

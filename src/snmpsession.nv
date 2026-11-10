@@ -1,0 +1,712 @@
+// snmpsession.nv — an SNMP manager's request, as a step a caller drives
+// over datagrams it moves, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A session is a
+// `@value` the caller holds in a `var`.  It owns no socket and no clock.
+// The caller sends the datagram the session built, gives it every datagram
+// that arrives from the agent, and tells it how many milliseconds passed
+// with nothing arriving.  That makes an exchange replayable from a log,
+// and a test can play the agent by hand.
+//
+// THE LOOP is three calls.
+//
+//   1. Start a request: `request` for a GET, GETNEXT, SET or GETBULK PDU
+//      the caller built; `walk` for a subtree; `discover` for the first
+//      SNMPv3 exchange.  Each builds the datagram into `out` and answers
+//      `SNMP_OK`.  The caller sends it.
+//   2. When a datagram arrives, `on_datagram` reads it.  It answers a
+//      `SnmpStep`.  `deliver` means the first `count` variable bindings of
+//      `r` are results the caller takes; `action` `SNMP_ACT_SEND` means a
+//      new datagram, the next request of a walk, is in `out`.
+//   3. When time passes with no datagram, `tick` says how many
+//      milliseconds.  Once the wait is over it answers `SNMP_ACT_RESEND`,
+//      and the caller sends the SAME datagram again, which it has kept; or,
+//      after `max_tries` sends, it fails with `SNMP_FAIL_TIMEOUT`.
+//
+// THE REQUEST ID.  Each new request takes the next request-id.  A
+// retransmission keeps the request-id, so a late answer to the first send
+// still matches.  A datagram whose request-id, version or community is not
+// the one in flight, or that does not parse, is IGNORED: the step has
+// `ignored` set and nothing else, and the wait goes on.
+//
+// A WALK sends GetNext (SNMPv1) or GetBulk (SNMPv2c and v3) from the root,
+// hands the caller the variable bindings that are inside the subtree, and
+// carries on from the last one until a binding leaves the subtree, is
+// endOfMibView, or the agent answers noSuchName (SNMPv1's end).  A binding
+// whose name does not sort after the previous one ends the walk with
+// `SNMP_FAIL_NOT_INCREASING`, because an agent that repeats itself would
+// otherwise be walked for ever.
+//
+// SNMPv3.  A v3 session builds messages at the security level it was
+// given.  At noAuthNoPriv the messages are complete.  At a higher level
+// the message is built with the authentication parameters zero-filled and
+// the scoped PDU in the clear, and `snmpusm.protect` finishes it: it
+// encrypts, sets the privacy flag and writes the digest.  A datagram that
+// arrives is passed through `snmpusm.unprotect` first, which checks the
+// digest and decrypts it into the same form.  `discover` learns the agent's
+// engine ID, boots and time from its Report (RFC 3414 section 4).
+
+use snmpber
+use snmperr
+use snmpoid
+use snmppdu
+use snmpv3
+
+// No datagram to send: the caller waits.
+pub const SNMP_ACT_NONE = 0
+// Send the datagram in `out`.
+pub const SNMP_ACT_SEND = 1
+// Send the datagram that was sent last again.
+pub const SNMP_ACT_RESEND = 2
+
+// The session is not waiting for anything.
+pub const SNMP_PHASE_IDLE = 0
+// A request is in flight.
+pub const SNMP_PHASE_WAITING = 1
+
+// One request and its answer.
+pub const SNMP_OP_REQUEST = 1
+// A walk of a subtree.
+pub const SNMP_OP_WALK = 2
+// Engine discovery.
+pub const SNMP_OP_DISCOVER = 3
+
+// No failure: 0.
+pub const SNMP_FAIL_NONE = 0
+// `max_tries` sends went unanswered: 1.
+pub const SNMP_FAIL_TIMEOUT = 1
+// A walk met a name that does not sort after the one before: 2.
+pub const SNMP_FAIL_NOT_INCREASING = 2
+// The agent answered with a Report that is not engine discovery: 3.  The
+// step's `report` says which counter.
+pub const SNMP_FAIL_REPORT = 3
+// A v3 message was outside the time window: 4.
+pub const SNMP_FAIL_TIME_WINDOW = 4
+
+// The default wait for an answer, in milliseconds: 3000.
+pub const SNMP_TIMEOUT_DEFAULT = 3000
+// The default number of sends of one request: 3.
+pub const SNMP_TRIES_DEFAULT = 3
+
+// What a call to the session answers.
+pub @value
+struct SnmpStep
+    // One of the `SNMP_ACT_` values.
+    action: Int
+    // Whether the first `count` bindings of the PDU the caller gave are
+    // results to take.
+    deliver: Bool
+    // How many.
+    count: Int
+    // Whether the request or the walk is complete.
+    done: Bool
+    // Whether it ended without completing.
+    failed: Bool
+    // One of the `SNMP_FAIL_` values, when `failed`.
+    reason: Int
+    // The error-status of the Response, when `done`.
+    status: Int
+    // Its error-index.
+    index: Int
+    // For a Report: the N of the usmStats counter 1.3.6.1.6.3.15.1.1.N.0
+    // that came with it, 1 to 6, or 0.
+    report: Int
+    // Whether the datagram was not for this session.
+    ignored: Bool
+
+// The state of one manager's exchange with one agent.
+pub @value
+struct SnmpSession
+    // `SNMP_V1`, `SNMP_V2C` or `SNMP_V3`.
+    version: Int
+    // The community string, for v1 and v2c.
+    community: SnmpName
+    // For v3: the user, the authoritative engine's ID once known, and the
+    // authentication parameters placeholder.
+    usm: SnmpUsm
+    // For v3: `SNMP_FLAG_AUTH` and `SNMP_FLAG_PRIV` as the level asks.
+    level: Int
+    // For v3: the length of the authentication parameters of the user's
+    // protocol: 12, 16, 24, 32 or 48.  0 at noAuthNoPriv.
+    auth_len: Int
+    // For v3: the context engine ID and name of the scoped PDU.
+    context: SnmpScoped
+    // For v3: the agent's clock as last seen.
+    sync: SnmpEngineSync
+    // For v3: milliseconds since `sync` was updated.
+    elapsed_ms: Int
+    // For v3: the next msgID.
+    msg_id: Int
+    // The next request-id.
+    next_id: Int
+    // The request-id in flight.
+    request_id: Int
+    // The msgID in flight, v3 only.
+    flight_msg: Int
+    // One of the `SNMP_PHASE_` values.
+    phase: Int
+    // One of the `SNMP_OP_` values.
+    op: Int
+    // How many times the request has been sent.
+    tries: Int
+    // How many sends before giving up.
+    max_tries: Int
+    // Milliseconds waited since the last send.
+    waited: Int
+    // Milliseconds to wait for an answer.
+    timeout_ms: Int
+    // The root of a walk.
+    root: SnmpOid
+    // Where a walk has got to.
+    cursor: SnmpOid
+    // The max-repetitions of a v2c or v3 walk.
+    max_rep: Int
+
+// The step that does nothing.
+@tier(embedded)
+@no_alloc
+fn quiet() -> SnmpStep []
+    SnmpStep { action: SNMP_ACT_NONE, deliver: false, count: 0, done: false, failed: false,
+               reason: SNMP_FAIL_NONE, status: 0, index: 0, report: 0, ignored: false }
+
+// The step for a datagram that was not for this session.
+@tier(embedded)
+@no_alloc
+fn ignored() -> SnmpStep []
+    SnmpStep { action: SNMP_ACT_NONE, deliver: false, count: 0, done: false, failed: false,
+               reason: SNMP_FAIL_NONE, status: 0, index: 0, report: 0, ignored: true }
+
+// The step for a failure.
+@tier(embedded)
+@no_alloc
+fn failure(reason: Int) -> SnmpStep []
+    SnmpStep { action: SNMP_ACT_NONE, deliver: false, count: 0, done: false, failed: true,
+               reason: reason, status: 0, index: 0, report: 0, ignored: false }
+
+// A session for SNMPv1 or SNMPv2c with a community string of up to 32
+// bytes.  `first_id` is the first request-id, from 1 to 2147483647; any
+// other value starts at 1.  The wait is `SNMP_TIMEOUT_DEFAULT` and the sends
+// `SNMP_TRIES_DEFAULT`.
+//
+// ```novo
+// use snmpsession
+// use snmppdu
+//
+// fn main() [io]
+//     let s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+//     println("${s.version} ${s.community.len()} ${s.next_id}")   // 1 6 100
+// ```
+pub @tier(embedded)
+@no_alloc
+fn session_new(version: Int, community: Str, first_id: Int) -> SnmpSession []
+    var c: SnmpName = Vec.new()
+    let _ok = snmpber.name_set(var c, community)
+    SnmpSession { version: version, community: c, usm: snmpv3.usm_empty(), level: 0, auth_len: 0,
+                  context: snmpv3.scoped_empty(), sync: SnmpEngineSync { boots: 0, time: 0, latest: 0 },
+                  elapsed_ms: 0, msg_id: 1, next_id: first_id_of(first_id), request_id: 0, flight_msg: 0,
+                  phase: SNMP_PHASE_IDLE, op: 0, tries: 0, max_tries: SNMP_TRIES_DEFAULT, waited: 0,
+                  timeout_ms: SNMP_TIMEOUT_DEFAULT, root: snmpoid.oid_empty(), cursor: snmpoid.oid_empty(),
+                  max_rep: snmppdu.SNMP_VARBINDS_MAX }
+
+// A request-id from a seed: the seed when it is from 1 to 2147483647, and
+// 1 otherwise.
+@tier(embedded)
+@no_alloc
+fn first_id_of(seed: Int) -> Int []
+    if seed < 1 or seed > 2147483647
+        return 1
+    seed
+
+// A session for SNMPv3 with a user name of up to 32 bytes.  `level` is 0
+// for noAuthNoPriv, `SNMP_FLAG_AUTH` for authNoPriv and `SNMP_FLAG_AUTH`
+// with `SNMP_FLAG_PRIV` for authPriv; `auth_len` is the length of the
+// digest the user's authentication protocol writes.  The engine ID is not
+// known until `discover` has run, or `engine_known` is called.
+//
+// ```novo
+// use snmpsession
+// use snmpv3
+//
+// fn main() [io]
+//     let s = snmpsession.session_v3("bert", snmpv3.SNMP_FLAG_AUTH, 12, 100)
+//     println("${s.version} ${s.usm.user.len()} ${s.auth_len}")   // 3 4 12
+// ```
+pub @tier(embedded)
+@no_alloc
+fn session_v3(user: Str, level: Int, auth_len: Int, first_id: Int) -> SnmpSession []
+    var u = snmpv3.usm_empty()
+    let _ok = snmpber.name_set(var u.user, user)
+    SnmpSession { version: snmppdu.SNMP_V3, community: Vec.new(), usm: u, level: level, auth_len: auth_len,
+                  context: snmpv3.scoped_empty(), sync: SnmpEngineSync { boots: 0, time: 0, latest: 0 },
+                  elapsed_ms: 0, msg_id: first_id_of(first_id), next_id: first_id_of(first_id), request_id: 0,
+                  flight_msg: 0, phase: SNMP_PHASE_IDLE, op: 0, tries: 0, max_tries: SNMP_TRIES_DEFAULT, waited: 0,
+                  timeout_ms: SNMP_TIMEOUT_DEFAULT, root: snmpoid.oid_empty(), cursor: snmpoid.oid_empty(),
+                  max_rep: snmppdu.SNMP_VARBINDS_MAX }
+
+// Change the wait and the number of sends.  A wait under 1 millisecond or
+// a count under 1 is ignored.
+//
+// ```novo
+// use snmpsession
+// use snmppdu
+//
+// fn main() [io]
+//     var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 1)
+//     snmpsession.set_limits(var s, 500, 5)
+//     println("${s.timeout_ms} ${s.max_tries}")   // 500 5
+// ```
+pub @tier(embedded)
+@no_alloc
+fn set_limits(var s: SnmpSession, timeout_ms: Int, max_tries: Int) []
+    if timeout_ms >= 1
+        s.timeout_ms = timeout_ms
+    if max_tries >= 1
+        s.max_tries = max_tries
+
+// Set the max-repetitions a walk asks for, 1 to `SNMP_VARBINDS_MAX`.
+// Another value is ignored.
+//
+// ```novo
+// use snmpsession
+// use snmppdu
+//
+// fn main() [io]
+//     var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 1)
+//     snmpsession.set_max_repetitions(var s, 4)
+//     println("${s.max_rep}")   // 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn set_max_repetitions(var s: SnmpSession, n: Int) []
+    if n >= 1 and n <= snmppdu.SNMP_VARBINDS_MAX
+        s.max_rep = n
+
+// Tell a v3 session an agent's engine ID, boots and time that were learned
+// some other way than `discover`.  The ID is copied.
+//
+// ```novo
+// use snmpsession
+// use snmpv3
+//
+// fn main() [io]
+//     var s = snmpsession.session_v3("bert", 0, 0, 1)
+//     var id: snmpv3.SnmpName = Vec.new()
+//     let _x = snmpber.name_set(var id, "engine")
+//     snmpsession.engine_known(var s, var id, 3, 700)
+//     println("${s.usm.engine_id.len()} ${s.sync.boots}")   // 6 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn engine_known(var s: SnmpSession, var id: SnmpName, boots: Int, time: Int) []
+    s.usm.engine_id.clear()
+    for i in 0..id.len()
+        let _ok = s.usm.engine_id.push(id[i])
+    s.context.context_engine.clear()
+    for i in 0..id.len()
+        let _ok = s.context.context_engine.push(id[i])
+    s.sync = SnmpEngineSync { boots: boots, time: time, latest: time }
+    s.elapsed_ms = 0
+
+// The agent's time as this session estimates it: the time it reported,
+// plus what has passed since, in seconds.
+//
+// ```novo
+// use snmpsession
+//
+// fn main() [io]
+//     var s = snmpsession.session_v3("bert", 0, 0, 1)
+//     println("${snmpsession.engine_time(s)}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn engine_time(s: SnmpSession) -> Int []
+    s.sync.time + s.elapsed_ms / 1000
+
+// Whether no request is in flight.
+//
+// ```novo
+// use snmpsession
+// use snmppdu
+//
+// fn main() [io]
+//     let s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 1)
+//     println("${snmpsession.is_idle(s)}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn is_idle(s: SnmpSession) -> Bool []
+    s.phase == SNMP_PHASE_IDLE
+
+// The request-id for the next request: the one stored, and the one after
+// it, which wraps from 2147483647 to 1.
+@tier(embedded)
+@no_alloc
+fn take_id(var s: SnmpSession) -> Int []
+    let id = s.next_id
+    s.next_id = if id >= 2147483647 then 1 else id + 1
+    id
+
+// An authentication-parameters placeholder: `n` zero octets.
+@tier(embedded)
+@no_alloc
+fn zeros(n: Int) -> Vec[u8; SNMP_AUTH_PARAMS_MAX] []
+    var v: Vec[u8; SNMP_AUTH_PARAMS_MAX] = Vec.new()
+    for _i in 0..n
+        let _ok = v.push(0)
+    v
+
+// Build the message for a PDU into `out`, by the session's version.
+@tier(embedded)
+@no_alloc
+fn build_message(var s: SnmpSession, var p: SnmpPdu, var pool: SnmpBuf, var out: SnmpBuf) -> Int []
+    out.clear()
+    if s.version != snmppdu.SNMP_V3
+        if snmppdu.msg_encode_name(var out, s.version, var s.community, var p, var pool)
+            return snmperr.SNMP_OK
+        return snmperr.SNMP_E_BAD_PDU
+    var data: SnmpBuf = Vec.new()
+    if not snmpv3.scoped_encode(var data, var s.context, var p, var pool)
+        return snmperr.SNMP_E_BAD_PDU
+    let authed = (s.level & snmpv3.SNMP_FLAG_AUTH) != 0
+    var u = SnmpUsm { engine_id: s.usm.engine_id, boots: s.sync.boots, time: engine_time(s), user: s.usm.user,
+                      auth_params: zeros(if authed then s.auth_len else 0), priv_params: Vec.new() }
+    let flags = (s.level & snmpv3.SNMP_FLAG_AUTH) | snmpv3.SNMP_FLAG_REPORTABLE
+    let h = SnmpV3Header { msg_id: s.msg_id, max_size: snmpber.SNMP_MSG_MAX, flags: flags,
+                           model: snmpv3.SNMP_USM_MODEL }
+    var lay = snmpv3.layout_empty()
+    let c = snmpv3.v3_encode(var out, h, var u, var data, false, var lay)
+    if c == snmperr.SNMP_OK
+        s.flight_msg = s.msg_id
+        s.msg_id = if s.msg_id >= 2147483647 then 1 else s.msg_id + 1
+    c
+
+// Note a request as sent for the first time.
+@tier(embedded)
+@no_alloc
+fn started(var s: SnmpSession, op: Int, id: Int) []
+    s.phase = SNMP_PHASE_WAITING
+    s.op = op
+    s.request_id = id
+    s.tries = 1
+    s.waited = 0
+
+// Start a request: a GetRequest, GetNextRequest, SetRequest or
+// GetBulkRequest PDU the caller built with `snmppdu.pdu_new` and the
+// `add_` functions.  The session sets the request-id, builds the whole
+// message into `out` and waits for the answer; the caller sends `out` and
+// keeps it for a retransmission.  `pool` holds the bytes of any value that
+// is a span.
+//
+// Answers `SNMP_OK`; `SNMP_E_WRONG_STATE` when a request is in flight;
+// `SNMP_E_BAD_PDU` for any other tag, or a PDU that cannot be written.
+//
+// ```novo
+// use snmpsession
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 0)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")
+//     let _y = snmppdu.add_null(var p, var o)
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpsession.request(var s, var p, var pool, var out)} ${out.len()}")   // 0 43
+// ```
+pub @tier(embedded)
+@no_alloc
+fn request(var s: SnmpSession, var p: SnmpPdu, var pool: SnmpBuf, var out: SnmpBuf) -> Int []
+    if s.phase != SNMP_PHASE_IDLE
+        return snmperr.SNMP_E_WRONG_STATE
+    if p.tag != snmppdu.SNMP_PDU_GET and p.tag != snmppdu.SNMP_PDU_GET_NEXT and p.tag != snmppdu.SNMP_PDU_SET
+        and p.tag != snmppdu.SNMP_PDU_GET_BULK
+        return snmperr.SNMP_E_BAD_PDU
+    let id = take_id(var s)
+    var w = SnmpPdu { tag: p.tag, request_id: id, error_status: p.error_status, error_index: p.error_index,
+                      vbs: p.vbs }
+    let c = build_message(var s, var w, var pool, var out)
+    if c == snmperr.SNMP_OK
+        started(var s, SNMP_OP_REQUEST, id)
+    c
+
+// Build the next request of a walk from the cursor into `out`.
+@tier(embedded)
+@no_alloc
+fn walk_request(var s: SnmpSession, var out: SnmpBuf) -> Int []
+    let id = take_id(var s)
+    let bulk = s.version != snmppdu.SNMP_V1
+    var p = SnmpPdu { tag: if bulk then snmppdu.SNMP_PDU_GET_BULK else snmppdu.SNMP_PDU_GET_NEXT, request_id: id,
+                      error_status: 0, error_index: if bulk then s.max_rep else 0, vbs: Vec.new() }
+    let _added = snmppdu.add_null(var p, var s.cursor)
+    var pool: SnmpBuf = Vec.new()
+    let c = build_message(var s, var p, var pool, var out)
+    if c == snmperr.SNMP_OK
+        s.request_id = id
+        s.tries = 1
+        s.waited = 0
+    c
+
+// Start a walk of the subtree under `root`: a GetBulk request with the
+// session's max-repetitions in SNMPv2c and SNMPv3, and a GetNext in
+// SNMPv1.  Answers like `request`, and `SNMP_E_BAD_ARGUMENT` for a root of
+// fewer than two arcs.
+//
+// ```novo
+// use snmpsession
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+//     var root = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var root, "1.3.6.1.2.1.1")
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpsession.walk(var s, var root, var out)} ${out.len()}")   // 0 40
+// ```
+pub @tier(embedded)
+@no_alloc
+fn walk(var s: SnmpSession, var root: SnmpOid, var out: SnmpBuf) -> Int []
+    if s.phase != SNMP_PHASE_IDLE
+        return snmperr.SNMP_E_WRONG_STATE
+    if snmpoid.oid_len(var root) < 2
+        return snmperr.SNMP_E_BAD_ARGUMENT
+    snmpoid.oid_copy(var s.root, var root)
+    snmpoid.oid_copy(var s.cursor, var root)
+    let c = walk_request(var s, var out)
+    if c == snmperr.SNMP_OK
+        started(var s, SNMP_OP_WALK, s.request_id)
+    c
+
+// Start engine discovery (RFC 3414 section 4) for a v3 session: build the
+// message with an empty engine ID and user into `out`.  The agent's Report
+// carries its engine ID, boots and time, which `on_datagram` records; the
+// step that does so is `done`.
+//
+// ```novo
+// use snmpsession
+// use snmpber
+//
+// fn main() [io]
+//     var s = snmpsession.session_v3("bert", 0, 0, 100)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpsession.discover(var s, var out)} ${out.len()}")   // 0 54
+// ```
+pub @tier(embedded)
+@no_alloc
+fn discover(var s: SnmpSession, var out: SnmpBuf) -> Int []
+    if s.phase != SNMP_PHASE_IDLE or s.version != snmppdu.SNMP_V3
+        return snmperr.SNMP_E_WRONG_STATE
+    let id = take_id(var s)
+    let msg = s.msg_id
+    s.msg_id = if msg >= 2147483647 then 1 else msg + 1
+    if not snmpv3.discovery_request(var out, msg, id)
+        return snmperr.SNMP_E_NO_ROOM
+    s.flight_msg = msg
+    started(var s, SNMP_OP_DISCOVER, id)
+    snmperr.SNMP_OK
+
+// Let time pass.  `ms` is the number of milliseconds since the last call
+// or the last send.  While a request is in flight and the wait is not
+// over the step does nothing.  When it is over and sends remain, the
+// answer is `SNMP_ACT_RESEND`: the caller sends the same datagram again.
+// When none remain the request fails with `SNMP_FAIL_TIMEOUT` and the
+// session is idle.
+//
+// ```novo
+// use snmpsession
+// use snmppdu
+// use snmpber
+//
+// fn main() [io]
+//     var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 0)
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     let _r = snmpsession.request(var s, var p, var pool, var out)
+//     let t = snmpsession.tick(var s, 3000)
+//     println("${t.action}")   // 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn tick(var s: SnmpSession, ms: Int) -> SnmpStep []
+    s.elapsed_ms = s.elapsed_ms + ms
+    if s.phase != SNMP_PHASE_WAITING or ms < 0
+        return quiet()
+    s.waited = s.waited + ms
+    if s.waited < s.timeout_ms
+        return quiet()
+    if s.tries >= s.max_tries
+        s.phase = SNMP_PHASE_IDLE
+        return failure(SNMP_FAIL_TIMEOUT)
+    s.tries = s.tries + 1
+    s.waited = 0
+    SnmpStep { action: SNMP_ACT_RESEND, deliver: false, count: 0, done: false, failed: false,
+               reason: SNMP_FAIL_NONE, status: 0, index: 0, report: 0, ignored: false }
+
+// The step for a finished request or walk.
+@tier(embedded)
+@no_alloc
+fn finished(var s: SnmpSession, status: Int, index: Int, deliver: Bool, count: Int) -> SnmpStep []
+    s.phase = SNMP_PHASE_IDLE
+    SnmpStep { action: SNMP_ACT_NONE, deliver: deliver, count: count, done: true, failed: false,
+               reason: SNMP_FAIL_NONE, status: status, index: index, report: 0, ignored: false }
+
+// Read a v1 or v2c datagram into `r`.  Answers `SNMP_OK` when it is a
+// Response to the request in flight, and a fault code otherwise.
+@tier(embedded)
+@no_alloc
+fn receive_community(var s: SnmpSession, var inb: SnmpBuf, var r: SnmpPdu) -> Int []
+    var info = snmppdu.info_new()
+    var c = snmppdu.msg_decode(var inb, var info)
+    if c != snmperr.SNMP_OK
+        return c
+    if info.version != s.version or info.pdu_tag != snmppdu.SNMP_PDU_RESPONSE
+        return snmperr.SNMP_E_UNEXPECTED
+    if info.comm_len != s.community.len()
+        return snmperr.SNMP_E_UNEXPECTED
+    var same = true
+    for i in 0..info.comm_len
+        same = same and inb[info.comm_off + i] == s.community[i]
+    if not same
+        return snmperr.SNMP_E_UNEXPECTED
+    c = snmppdu.pdu_decode(var inb, info.pdu_off, info.pdu_end, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    if r.request_id != s.request_id
+        return snmperr.SNMP_E_UNEXPECTED
+    snmperr.SNMP_OK
+
+// The usmStats counter a Report carries: the N of 1.3.6.1.6.3.15.1.1.N.0,
+// from 1 to 6, or 0.
+@tier(embedded)
+@no_alloc
+fn report_code(var r: SnmpPdu) -> Int []
+    if r.vbs.len() < 1
+        return 0
+    var prefix = snmpoid.oid_empty()
+    let _p = snmpoid.oid_parse(var prefix, "1.3.6.1.6.3.15.1.1")
+    if not snmpoid.oid_is_prefix(var prefix, var r.vbs[0].oid) or snmpoid.oid_len(var r.vbs[0].oid) != 11
+        return 0
+    snmpoid.oid_arc(var r.vbs[0].oid, 9)
+
+// Read a v3 datagram into `r`.  Answers `SNMP_OK` for a Response or a
+// Report to the request in flight, and a fault code otherwise.  Records
+// the engine's clock from an authenticated message that is in the window,
+// and the engine's ID and clock from a Report.
+@tier(embedded)
+@no_alloc
+fn receive_v3(var s: SnmpSession, var inb: SnmpBuf, var r: SnmpPdu) -> Int []
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    var c = snmpv3.v3_decode(var inb, var h, var u, var lay)
+    if c != snmperr.SNMP_OK
+        return c
+    if lay.encrypted or h.msg_id != s.flight_msg
+        return snmperr.SNMP_E_UNEXPECTED
+    var sc = snmpv3.scoped_empty()
+    c = snmpv3.scoped_decode(var inb, lay.data_off, lay.body_off + lay.body_len, var sc, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    if r.tag == snmppdu.SNMP_PDU_REPORT
+        s.usm.engine_id.clear()
+        s.context.context_engine.clear()
+        for i in 0..u.engine_id.len()
+            let _a = s.usm.engine_id.push(u.engine_id[i])
+            let _b = s.context.context_engine.push(u.engine_id[i])
+        s.sync = SnmpEngineSync { boots: u.boots, time: u.time, latest: u.time }
+        s.elapsed_ms = 0
+        return snmperr.SNMP_OK
+    if r.request_id != s.request_id or r.tag != snmppdu.SNMP_PDU_RESPONSE
+        return snmperr.SNMP_E_UNEXPECTED
+    if (h.flags & snmpv3.SNMP_FLAG_AUTH) != 0
+        if not snmpv3.in_window_remote(var s.sync, engine_time(s), u.boots, u.time)
+            return snmperr.SNMP_E_NOT_IN_TIME_WINDOW
+        s.elapsed_ms = 0
+    snmperr.SNMP_OK
+
+// The step for the answer to a walk request: hand over the bindings inside
+// the subtree and ask for the next, or finish.
+@tier(embedded)
+@no_alloc
+fn walk_answer(var s: SnmpSession, var r: SnmpPdu, var out: SnmpBuf) -> SnmpStep []
+    if r.error_status != 0
+        let end = r.error_status == snmperr.SNMP_NO_SUCH_NAME and s.version == snmppdu.SNMP_V1
+        return finished(var s, if end then 0 else r.error_status, r.error_index, false, 0)
+    var n = 0
+    var more = r.vbs.len() > 0
+    for i in 0..r.vbs.len()
+        if more
+            if r.vbs[i].kind == snmppdu.SNMP_V_END_OF_MIB_VIEW or not snmpoid.oid_is_prefix(var s.root, var r.vbs[i].oid)
+                more = false
+            elif snmpoid.oid_compare(var s.cursor, var r.vbs[i].oid) >= 0
+                s.phase = SNMP_PHASE_IDLE
+                return SnmpStep { action: SNMP_ACT_NONE, deliver: n > 0, count: n, done: false, failed: true,
+                                  reason: SNMP_FAIL_NOT_INCREASING, status: 0, index: 0, report: 0, ignored: false }
+            else
+                n = n + 1
+                snmpoid.oid_copy(var s.cursor, var r.vbs[i].oid)
+    if not more
+        return finished(var s, 0, 0, n > 0, n)
+    if walk_request(var s, var out) != snmperr.SNMP_OK
+        s.phase = SNMP_PHASE_IDLE
+        return failure(SNMP_FAIL_REPORT)
+    SnmpStep { action: SNMP_ACT_SEND, deliver: n > 0, count: n, done: false, failed: false,
+               reason: SNMP_FAIL_NONE, status: 0, index: 0, report: 0, ignored: false }
+
+// Read a datagram that arrived.
+//
+// `r` receives the PDU the datagram held, and the spans in its variable
+// bindings are offsets into `inb`, so the caller keeps `inb` until it has
+// taken the values.  `out` receives the next request of a walk.  The step
+// says what to do:
+//
+// - `ignored`: the datagram was not the answer to the request in flight
+//   (it did not parse, came with another version, community, msgID or
+//   request-id, or was not a Response); nothing changed.
+// - `done`: the request or walk is complete.  `status` and `index` are the
+//   Response's error-status and error-index, `deliver` and `count` the
+//   bindings to take.  An error-status other than 0 is an answer, not a
+//   fault of the session.
+// - `action` `SNMP_ACT_SEND`: the walk goes on; send `out`.
+// - `failed`: the session could not complete, `reason` says why.
+//
+// ```novo
+// use snmpsession
+// use snmppdu
+// use snmpber
+//
+// fn main() [io]
+//     var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+//     var inb: snmpber.SnmpBuf = Vec.new()
+//     var r = snmppdu.pdu_new(0, 0)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     let st = snmpsession.on_datagram(var s, var inb, var r, var out)
+//     println("${st.ignored}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn on_datagram(var s: SnmpSession, var inb: SnmpBuf, var r: SnmpPdu, var out: SnmpBuf) -> SnmpStep []
+    if s.phase != SNMP_PHASE_WAITING
+        return ignored()
+    let c = if s.version == snmppdu.SNMP_V3 then receive_v3(var s, var inb, var r) else receive_community(var s, var inb, var r)
+    if c == snmperr.SNMP_E_NOT_IN_TIME_WINDOW
+        s.phase = SNMP_PHASE_IDLE
+        return failure(SNMP_FAIL_TIME_WINDOW)
+    if c != snmperr.SNMP_OK
+        return ignored()
+    if r.tag == snmppdu.SNMP_PDU_REPORT
+        s.phase = SNMP_PHASE_IDLE
+        let code = report_code(var r)
+        if s.op == SNMP_OP_DISCOVER and code == 4
+            return SnmpStep { action: SNMP_ACT_NONE, deliver: false, count: 0, done: true, failed: false,
+                              reason: SNMP_FAIL_NONE, status: 0, index: 0, report: code, ignored: false }
+        return SnmpStep { action: SNMP_ACT_NONE, deliver: false, count: 0, done: false, failed: true,
+                          reason: SNMP_FAIL_REPORT, status: 0, index: 0, report: code, ignored: false }
+    if s.op == SNMP_OP_WALK
+        return walk_answer(var s, var r, var out)
+    finished(var s, r.error_status, r.error_index, true, r.vbs.len())

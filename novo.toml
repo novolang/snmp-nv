@@ -1,0 +1,29 @@
+[package]
+name        = "snmp-nv"
+version     = "0.1.0"
+description = "SNMP for novo-lang: the PDUs of RFC 3416 and the v1 messages and trap of RFC 1157 built into and read from a caller's buffer with no allocation, object identifiers and the SMIv2 value types over the BER of asn1-nv, the SNMPv3 message of RFC 3412 and the User-based Security Model of RFC 3414 (HMAC-MD5-96, HMAC-SHA-96 and the SHA-2 variants of RFC 7860, CBC-DES, and AES-128-CFB of RFC 3826), and a get, getnext, walk and set client as a step a caller drives over datagrams it moves. MIB parsing is not implemented."
+license     = "Apache-2.0"
+stability   = "experimental"
+layer       = "core"
+host_modules = ["snmpusm", "snmpdes", "snmptext"]
+category    = "networking"
+tags        = ["snmp", "rfc3416", "rfc1157", "rfc3412", "rfc3414", "rfc3826", "rfc7860", "usm", "oid", "ber", "embedded", "sans-io", "no-alloc"]
+repository  = "https://github.com/novolang/snmp-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "SNMP requests and responses on a device with no heap, and the v3 security that does not fit one"
+
+[dependencies]
+# BER's identifier and length octets and the packing of an object
+# identifier's arcs, as arithmetic over integers.  asn1tag, the module of
+# asn1-nv that builds for a microcontroller, is the only one the embedded
+# modules use.
+asn1-nv   = "^0.2.0"
+# The hashes, HMAC and AES block the User-based Security Model needs.  Only
+# the host modules use it.
+crypto-nv = "^0.1.8"

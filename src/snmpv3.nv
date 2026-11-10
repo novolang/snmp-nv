@@ -1,0 +1,577 @@
+// snmpv3.nv — the SNMPv3 message of RFC 3412 and the framing of the
+// User-based Security Model of RFC 3414, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  This module builds
+// and reads the BYTES of a v3 message and decides the questions that are
+// integer arithmetic: the flags, the time window, the identifiers.  It
+// computes no digest and no cipher: `snmpusm`, which is outside the
+// embedded modules, does that over the offsets this module reports.
+//
+// THE MESSAGE (RFC 3412 section 6):
+//
+//   SEQUENCE {
+//     msgVersion              INTEGER (3)
+//     msgGlobalData           SEQUENCE { msgID, msgMaxSize, msgFlags,
+//                                        msgSecurityModel }
+//     msgSecurityParameters   OCTET STRING, holding the USM sequence
+//     msgData                 a ScopedPDU, or an OCTET STRING holding it
+//                             encrypted
+//   }
+//
+// THE USM SEQUENCE (RFC 3414 section 2.4) is the authoritative engine's
+// identifier, boots and time, the user name, the authentication
+// parameters (the HMAC digest, 12 octets for HMAC-MD5-96 and HMAC-SHA-96,
+// 16, 24, 32 or 48 for the SHA-2 variants of RFC 7860) and the privacy
+// parameters (the 8-octet salt of DES or AES).
+//
+// THE ORDER OF OPERATIONS to send an authenticated message is: build the
+// scoped PDU (`scoped_encode`), encrypt it if privacy is wanted, build the
+// message with the authentication parameters filled with zeros
+// (`v3_encode`), compute the HMAC over the whole message, and write it at
+// `lay.auth_off`.  To receive, read the message (`v3_decode`), check the
+// HMAC over a copy with the authentication parameters zeroed, decrypt,
+// and read the scoped PDU (`scoped_decode`).
+//
+// ENGINE DISCOVERY (RFC 3414 section 4).  A manager that does not know an
+// agent's engine ID sends a message with an empty engine ID, an empty
+// user name and security level noAuthNoPriv with the reportable flag set.
+// The agent answers with a Report PDU carrying the counter
+// usmStatsUnknownEngineIDs, and its engine ID, boots and time in the
+// security parameters.  `discovery_request` builds that message.
+
+use snmpber
+use snmperr
+use snmppdu
+
+// The longest authentication parameters held here: 48 octets, the HMAC of
+// SHA-512 cut to 384 bits (RFC 7860).
+pub const SNMP_AUTH_PARAMS_MAX = 48
+// The longest privacy parameters: 8 octets.
+pub const SNMP_PRIV_PARAMS_MAX = 8
+// The security model number of the User-based Security Model: 3.
+pub const SNMP_USM_MODEL = 3
+// msgFlags bit 0: the message is authenticated.
+pub const SNMP_FLAG_AUTH = 1
+// msgFlags bit 1: the scoped PDU is encrypted.
+pub const SNMP_FLAG_PRIV = 2
+// msgFlags bit 2: a Report may be sent in answer.
+pub const SNMP_FLAG_REPORTABLE = 4
+// The width of the time window, in seconds: 150 (RFC 3414 section 2.2.3).
+pub const SNMP_TIME_WINDOW = 150
+// The smallest msgMaxSize: 484 (RFC 3412 section 6.4).
+pub const SNMP_MAX_SIZE_MIN = 484
+// The largest value of engine boots, after which an engine's time is no
+// longer valid: 2147483647.
+pub const SNMP_BOOTS_MAX = 2147483647
+
+// The User-based Security Model parameters of a message.
+pub @value
+struct SnmpUsm
+    // msgAuthoritativeEngineID.  Empty in a discovery request.
+    engine_id: snmpber.SnmpName
+    // msgAuthoritativeEngineBoots.
+    boots: Int
+    // msgAuthoritativeEngineTime, in seconds.
+    time: Int
+    // msgUserName.
+    user: snmpber.SnmpName
+    // msgAuthenticationParameters: empty for noAuth, zeros while the
+    // digest is computed, the digest when sent.
+    auth_params: Vec[u8; SNMP_AUTH_PARAMS_MAX]
+    // msgPrivacyParameters: the salt, or empty.
+    priv_params: Vec[u8; SNMP_PRIV_PARAMS_MAX]
+
+// The msgGlobalData of a message.
+pub @value
+struct SnmpV3Header
+    // msgID, 0 to 2147483647.
+    msg_id: Int
+    // msgMaxSize, 484 to 2147483647: the largest message the sender can
+    // receive.
+    max_size: Int
+    // msgFlags: `SNMP_FLAG_AUTH`, `SNMP_FLAG_PRIV`, `SNMP_FLAG_REPORTABLE`.
+    flags: Int
+    // msgSecurityModel; 3 is the User-based Security Model.
+    model: Int
+
+// The ScopedPDU's context.
+pub @value
+struct SnmpScoped
+    // contextEngineID.
+    context_engine: snmpber.SnmpName
+    // contextName.
+    context_name: snmpber.SnmpName
+
+// Where the parts of a v3 message are in its bytes.
+pub @value
+struct SnmpV3Layout
+    // The offset of the first octet of the authentication parameters.
+    auth_off: Int
+    // Their length.
+    auth_len: Int
+    // The offset of the identifier octet of msgData.
+    data_off: Int
+    // The offset of the first octet of what msgData holds: the scoped
+    // PDU's sequence, or the ciphertext.
+    body_off: Int
+    // How many octets that is.
+    body_len: Int
+    // True when msgData is an OCTET STRING holding ciphertext.
+    encrypted: Bool
+
+// What an engine knows of another engine's clock (RFC 3414 section
+// 2.2.1).
+pub @value
+struct SnmpEngineSync
+    // The latest boots counter seen from the engine.
+    boots: Int
+    // The engine's time at the moment it was last seen, in seconds.
+    time: Int
+    // latestReceivedEngineTime.
+    latest: Int
+
+// A set of security parameters with every field empty or 0.
+//
+// ```novo
+// use snmpv3
+//
+// fn main() [io]
+//     let u = snmpv3.usm_empty()
+//     println("${u.boots} ${u.user.len()}")   // 0 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn usm_empty() -> SnmpUsm []
+    SnmpUsm { engine_id: Vec.new(), boots: 0, time: 0, user: Vec.new(), auth_params: Vec.new(),
+              priv_params: Vec.new() }
+
+// A header with every field 0.
+//
+// ```novo
+// use snmpv3
+//
+// fn main() [io]
+//     let h = snmpv3.header_empty()
+//     println("${h.msg_id} ${h.model}")   // 0 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn header_empty() -> SnmpV3Header []
+    SnmpV3Header { msg_id: 0, max_size: 0, flags: 0, model: 0 }
+
+// A scoped PDU context with an empty engine ID and name.
+//
+// ```novo
+// use snmpv3
+//
+// fn main() [io]
+//     let s = snmpv3.scoped_empty()
+//     println("${s.context_name.len()}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn scoped_empty() -> SnmpScoped []
+    SnmpScoped { context_engine: Vec.new(), context_name: Vec.new() }
+
+// A layout with every field 0.
+//
+// ```novo
+// use snmpv3
+//
+// fn main() [io]
+//     let l = snmpv3.layout_empty()
+//     println("${l.encrypted}")   // false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn layout_empty() -> SnmpV3Layout []
+    SnmpV3Layout { auth_off: 0, auth_len: 0, data_off: 0, body_off: 0, body_len: 0, encrypted: false }
+
+// Read one OCTET STRING of at most `max` octets at `at`, answering its
+// header; `ok` is false for another tag or a longer string.
+@tier(embedded)
+@no_alloc
+fn octets_head(var b: SnmpBuf, at: Int, limit: Int, max: Int) -> SnmpHead []
+    let h = snmpber.read_head(var b, at, limit)
+    if h.ok and h.tag != snmpber.SNMP_TAG_OCTET_STRING
+        return SnmpHead { ok: false, tag: h.tag, len: 0, hdr: 0, code: snmperr.SNMP_E_BAD_TAG }
+    if h.ok and h.len > max
+        return SnmpHead { ok: false, tag: h.tag, len: h.len, hdr: h.hdr, code: snmperr.SNMP_E_BAD_SECURITY_PARAMS }
+    h
+
+// Read one non-negative INTEGER of 31 bits at `at`: the value and the
+// position after it, in `out`, as `snmppdu`'s reader does.  Answers a
+// code.
+@tier(embedded)
+@no_alloc
+fn small_int(var b: SnmpBuf, at: Int, limit: Int, var out: Vec[Int; 2]) -> Int []
+    let h = snmpber.read_head(var b, at, limit)
+    if not h.ok
+        return h.code
+    if h.tag != snmpber.SNMP_TAG_INTEGER
+        return snmperr.SNMP_E_BAD_TAG
+    let n = snmpber.read_integer(var b, at + h.hdr, h.len)
+    if not n.ok or n.value < 0 or n.value > SNMP_BOOTS_MAX
+        return snmperr.SNMP_E_BAD_HEADER
+    out.clear()
+    let _a = out.push(n.value)
+    let _c = out.push(at + h.hdr + h.len)
+    snmperr.SNMP_OK
+
+// Write the USM sequence inside its OCTET STRING.
+@tier(embedded)
+@no_alloc
+fn put_usm(var out: SnmpBuf, var usm: SnmpUsm) -> Bool []
+    let outer = snmpber.begin(var out)
+    let seq = snmpber.begin(var out)
+    var ok = snmpber.put_name(var out, var usm.engine_id)
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, usm.boots)
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, usm.time)
+    ok = ok and snmpber.put_name(var out, var usm.user)
+    ok = ok and snmpber.put_head(var out, snmpber.SNMP_TAG_OCTET_STRING, usm.auth_params.len())
+    for i in 0..usm.auth_params.len()
+        ok = ok and snmpber.put_byte(var out, usm.auth_params[i] as Int)
+    ok = ok and snmpber.put_head(var out, snmpber.SNMP_TAG_OCTET_STRING, usm.priv_params.len())
+    for i in 0..usm.priv_params.len()
+        ok = ok and snmpber.put_byte(var out, usm.priv_params[i] as Int)
+    ok = ok and snmpber.end(var out, seq, snmpber.SNMP_TAG_SEQUENCE)
+    ok and snmpber.end(var out, outer, snmpber.SNMP_TAG_OCTET_STRING)
+
+// Build a v3 message into `out`.
+//
+// `data` is what msgData holds.  With `encrypted` false it is a whole
+// scoped PDU as `scoped_encode` wrote it; with `encrypted` true it is the
+// ciphertext, and `v3_encode` wraps it in an OCTET STRING.  `lay` answers
+// where the authentication parameters and the data are, so that the HMAC
+// can be written in place.  Answers `SNMP_OK`; `SNMP_E_BAD_ARGUMENT`
+// for a header whose msgID or msgMaxSize is out of range; `SNMP_E_BAD_FLAGS`
+// for privacy without authentication, or flags that disagree with
+// `encrypted`; or `SNMP_E_NO_ROOM`.
+//
+// ```novo
+// use snmpv3
+// use snmpber
+//
+// fn main() [io]
+//     var u = snmpv3.usm_empty()
+//     let h = snmpv3.SnmpV3Header { msg_id: 1, max_size: 1472, flags: 4, model: 3 }
+//     var data: snmpber.SnmpBuf = Vec.new()
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var lay = snmpv3.layout_empty()
+//     let _s = snmpber.put_head(var data, snmpber.SNMP_TAG_SEQUENCE, 0)
+//     println("${snmpv3.v3_encode(var out, h, var u, var data, false, var lay)} ${out.len()}")   // 0 38
+// ```
+pub @tier(embedded)
+@no_alloc
+fn v3_encode(var out: SnmpBuf, h: SnmpV3Header, var usm: SnmpUsm, var data: SnmpBuf, encrypted: Bool,
+             var lay: SnmpV3Layout) -> Int []
+    if h.msg_id < 0 or h.msg_id > SNMP_BOOTS_MAX or h.max_size < SNMP_MAX_SIZE_MIN or h.max_size > SNMP_BOOTS_MAX
+        or h.model < 1 or h.model > SNMP_BOOTS_MAX
+        return snmperr.SNMP_E_BAD_ARGUMENT
+    let priv = (h.flags & SNMP_FLAG_PRIV) != 0
+    if (priv and (h.flags & SNMP_FLAG_AUTH) == 0) or priv != encrypted or h.flags < 0 or h.flags > 255
+        return snmperr.SNMP_E_BAD_FLAGS
+    let mark = snmpber.begin(var out)
+    var ok = snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, SNMP_V3_VERSION)
+    let g = snmpber.begin(var out)
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, h.msg_id)
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, h.max_size)
+    ok = ok and snmpber.put_head(var out, snmpber.SNMP_TAG_OCTET_STRING, 1)
+    ok = ok and snmpber.put_byte(var out, h.flags)
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, h.model)
+    ok = ok and snmpber.end(var out, g, snmpber.SNMP_TAG_SEQUENCE)
+    ok = ok and put_usm(var out, var usm)
+    if encrypted
+        ok = ok and snmpber.put_span(var out, snmpber.SNMP_TAG_OCTET_STRING, var data, 0, data.len())
+    else
+        ok = ok and snmpber.put_raw(var out, var data, 0, data.len())
+    ok = ok and snmpber.end(var out, mark, snmpber.SNMP_TAG_SEQUENCE)
+    if not ok
+        return snmperr.SNMP_E_NO_ROOM
+    var h2 = header_empty()
+    var u2 = usm_empty()
+    v3_decode(var out, var h2, var u2, var lay)
+
+// The version number of SNMPv3 as `msgVersion` carries it: 3.
+pub const SNMP_V3_VERSION = 3
+
+// Read the outside of a v3 message: the header, the security parameters
+// and where msgData is.
+//
+// Answers `SNMP_OK`, or: `SNMP_E_BAD_VERSION` when msgVersion is not 3;
+// `SNMP_E_BAD_HEADER` for a msgID or a msgMaxSize out of range;
+// `SNMP_E_BAD_FLAGS` for privacy without authentication;
+// `SNMP_E_BAD_SECURITY_MODEL` for a model other than 3;
+// `SNMP_E_BAD_SECURITY_PARAMS` for parameters that are not the sequence
+// of RFC 3414 section 2.4 or hold an octet string over its limit; and the
+// faults of `read_head`.  Octets after the end of the message sequence
+// are `SNMP_E_BAD_LENGTH`.
+//
+// ```novo
+// use snmpv3
+// use snmpber
+//
+// fn main() [io]
+//     var u = snmpv3.usm_empty()
+//     let h = snmpv3.SnmpV3Header { msg_id: 1, max_size: 1472, flags: 4, model: 3 }
+//     var data: snmpber.SnmpBuf = Vec.new()
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var lay = snmpv3.layout_empty()
+//     let _s = snmpber.put_head(var data, snmpber.SNMP_TAG_SEQUENCE, 0)
+//     let _e = snmpv3.v3_encode(var out, h, var u, var data, false, var lay)
+//     var h2 = snmpv3.header_empty()
+//     var u2 = snmpv3.usm_empty()
+//     println("${snmpv3.v3_decode(var out, var h2, var u2, var lay)} ${h2.msg_id}")   // 0 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn v3_decode(var b: SnmpBuf, var h: SnmpV3Header, var usm: SnmpUsm, var lay: SnmpV3Layout) -> Int []
+    let m = snmpber.read_head(var b, 0, b.len())
+    if not m.ok
+        return m.code
+    if m.tag != snmpber.SNMP_TAG_SEQUENCE
+        return snmperr.SNMP_E_BAD_TAG
+    if m.hdr + m.len != b.len()
+        return snmperr.SNMP_E_BAD_LENGTH
+    var r: Vec[Int; 2] = Vec.new()
+    var c = small_int(var b, m.hdr, b.len(), var r)
+    if c != snmperr.SNMP_OK
+        return c
+    if r[0] != SNMP_V3_VERSION
+        return snmperr.SNMP_E_BAD_VERSION
+    let g = snmpber.read_head(var b, r[1], b.len())
+    if not g.ok
+        return g.code
+    if g.tag != snmpber.SNMP_TAG_SEQUENCE
+        return snmperr.SNMP_E_BAD_TAG
+    let gend = r[1] + g.hdr + g.len
+    c = small_int(var b, r[1] + g.hdr, gend, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    h.msg_id = r[0]
+    c = small_int(var b, r[1], gend, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    if r[0] < SNMP_MAX_SIZE_MIN
+        return snmperr.SNMP_E_BAD_HEADER
+    h.max_size = r[0]
+    let f = snmpber.read_head(var b, r[1], gend)
+    if not f.ok
+        return f.code
+    if f.tag != snmpber.SNMP_TAG_OCTET_STRING or f.len != 1
+        return snmperr.SNMP_E_BAD_FLAGS
+    h.flags = b[r[1] + f.hdr] as Int
+    if (h.flags & SNMP_FLAG_PRIV) != 0 and (h.flags & SNMP_FLAG_AUTH) == 0
+        return snmperr.SNMP_E_BAD_FLAGS
+    c = small_int(var b, r[1] + f.hdr + f.len, gend, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    if r[0] < 1 or r[1] != gend
+        return snmperr.SNMP_E_BAD_HEADER
+    h.model = r[0]
+    if h.model != SNMP_USM_MODEL
+        return snmperr.SNMP_E_BAD_SECURITY_MODEL
+    c = read_usm(var b, gend, var usm, var lay, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    let d = snmpber.read_head(var b, r[1], b.len())
+    if not d.ok
+        return d.code
+    if d.tag != snmpber.SNMP_TAG_SEQUENCE and d.tag != snmpber.SNMP_TAG_OCTET_STRING
+        return snmperr.SNMP_E_BAD_TAG
+    if r[1] + d.hdr + d.len != b.len()
+        return snmperr.SNMP_E_BAD_LENGTH
+    lay.data_off = r[1]
+    lay.body_off = r[1] + d.hdr
+    lay.body_len = d.len
+    lay.encrypted = d.tag == snmpber.SNMP_TAG_OCTET_STRING
+    if (h.flags & SNMP_FLAG_PRIV) != 0 and not lay.encrypted
+        return snmperr.SNMP_E_BAD_FLAGS
+    snmperr.SNMP_OK
+
+// Read the security parameters at `at` into `usm` and `lay`; `r[1]` is
+// the position after them.
+@tier(embedded)
+@no_alloc
+fn read_usm(var b: SnmpBuf, at: Int, var usm: SnmpUsm, var lay: SnmpV3Layout, var r: Vec[Int; 2]) -> Int []
+    let o = snmpber.read_head(var b, at, b.len())
+    if not o.ok
+        return o.code
+    if o.tag != snmpber.SNMP_TAG_OCTET_STRING
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    let oend = at + o.hdr + o.len
+    let s = snmpber.read_head(var b, at + o.hdr, oend)
+    if not s.ok or s.tag != snmpber.SNMP_TAG_SEQUENCE or at + o.hdr + s.hdr + s.len != oend
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    let e = octets_head(var b, at + o.hdr + s.hdr, oend, snmpber.SNMP_NAME_MAX)
+    if not e.ok
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    let _n = snmpber.get_name(var b, at + o.hdr + s.hdr + e.hdr, e.len, var usm.engine_id)
+    var pos = at + o.hdr + s.hdr + e.hdr + e.len
+    var c = small_int(var b, pos, oend, var r)
+    if c != snmperr.SNMP_OK
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    usm.boots = r[0]
+    c = small_int(var b, r[1], oend, var r)
+    if c != snmperr.SNMP_OK
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    usm.time = r[0]
+    let u = octets_head(var b, r[1], oend, snmpber.SNMP_NAME_MAX)
+    if not u.ok
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    let _m = snmpber.get_name(var b, r[1] + u.hdr, u.len, var usm.user)
+    pos = r[1] + u.hdr + u.len
+    let a = octets_head(var b, pos, oend, SNMP_AUTH_PARAMS_MAX)
+    if not a.ok
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    usm.auth_params.clear()
+    for i in 0..a.len
+        let _x = usm.auth_params.push(b[pos + a.hdr + i])
+    lay.auth_off = pos + a.hdr
+    lay.auth_len = a.len
+    pos = pos + a.hdr + a.len
+    let p = octets_head(var b, pos, oend, SNMP_PRIV_PARAMS_MAX)
+    if not p.ok or pos + p.hdr + p.len != oend
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    usm.priv_params.clear()
+    for i in 0..p.len
+        let _y = usm.priv_params.push(b[pos + p.hdr + i])
+    r.clear()
+    let _a = r.push(0)
+    let _z = r.push(oend)
+    snmperr.SNMP_OK
+
+// Write a ScopedPDU: the context engine ID, the context name and the PDU
+// (RFC 3412 section 6.1).
+//
+// ```novo
+// use snmpv3
+// use snmppdu
+// use snmpber
+//
+// fn main() [io]
+//     var sc = snmpv3.scoped_empty()
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpv3.scoped_encode(var out, var sc, var p, var pool)} ${out.len()}")   // true 18
+// ```
+pub @tier(embedded)
+@no_alloc
+fn scoped_encode(var out: SnmpBuf, var sc: SnmpScoped, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
+    let mark = snmpber.begin(var out)
+    var ok = snmpber.put_name(var out, var sc.context_engine)
+    ok = ok and snmpber.put_name(var out, var sc.context_name)
+    ok = ok and snmppdu.pdu_encode(var out, var p, var pool)
+    ok and snmpber.end(var out, mark, snmpber.SNMP_TAG_SEQUENCE)
+
+// Read the ScopedPDU that fills bytes `at` to `limit` of `b`: the context
+// and the PDU, which `pdu_decode`'s spans refer to in `b`.  Answers
+// `SNMP_OK` or the code of the first fault.
+//
+// ```novo
+// use snmpv3
+// use snmppdu
+// use snmpber
+//
+// fn main() [io]
+//     var sc = snmpv3.scoped_empty()
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 9)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     let _e = snmpv3.scoped_encode(var out, var sc, var p, var pool)
+//     var sc2 = snmpv3.scoped_empty()
+//     var q = snmppdu.pdu_new(0, 0)
+//     println("${snmpv3.scoped_decode(var out, 0, out.len(), var sc2, var q)} ${q.request_id}")   // 0 9
+// ```
+pub @tier(embedded)
+@no_alloc
+fn scoped_decode(var b: SnmpBuf, at: Int, limit: Int, var sc: SnmpScoped, var p: SnmpPdu) -> Int []
+    let s = snmpber.read_head(var b, at, limit)
+    if not s.ok
+        return s.code
+    if s.tag != snmpber.SNMP_TAG_SEQUENCE
+        return snmperr.SNMP_E_DECRYPT
+    if at + s.hdr + s.len != limit
+        return snmperr.SNMP_E_BAD_LENGTH
+    let e = octets_head(var b, at + s.hdr, limit, snmpber.SNMP_NAME_MAX)
+    if not e.ok
+        return e.code
+    let _a = snmpber.get_name(var b, at + s.hdr + e.hdr, e.len, var sc.context_engine)
+    let npos = at + s.hdr + e.hdr + e.len
+    let n = octets_head(var b, npos, limit, snmpber.SNMP_NAME_MAX)
+    if not n.ok
+        return n.code
+    let _b = snmpber.get_name(var b, npos + n.hdr, n.len, var sc.context_name)
+    snmppdu.pdu_decode(var b, npos + n.hdr + n.len, limit, var p)
+
+// Build the message that starts engine discovery (RFC 3414 section 4): an
+// empty engine ID, an empty user name, security level noAuthNoPriv with
+// the reportable flag, and a GetRequest with no variable bindings.  The
+// agent's Report answers with its engine ID, boots and time.
+//
+// ```novo
+// use snmpv3
+// use snmpber
+//
+// fn main() [io]
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpv3.discovery_request(var out, 1, 7)} ${out.len()}")   // true 54
+// ```
+pub @tier(embedded)
+@no_alloc
+fn discovery_request(var out: SnmpBuf, msg_id: Int, request_id: Int) -> Bool []
+    var data: SnmpBuf = Vec.new()
+    var sc = scoped_empty()
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, request_id)
+    var pool: SnmpBuf = Vec.new()
+    var u = usm_empty()
+    var lay = layout_empty()
+    let h = SnmpV3Header { msg_id: msg_id, max_size: snmpber.SNMP_MSG_MAX, flags: SNMP_FLAG_REPORTABLE,
+                           model: SNMP_USM_MODEL }
+    out.clear()
+    scoped_encode(var data, var sc, var p, var pool) and v3_encode(var out, h, var u, var data, false, var lay) == snmperr.SNMP_OK
+
+// Whether a message from the authoritative engine is inside the time
+// window (RFC 3414 section 3.2 step 7a): the engine has not run out of
+// boots, the message's boots equal the engine's, and its time is within
+// 150 seconds of the engine's own.
+//
+// ```novo
+// use snmpv3
+//
+// fn main() [io]
+//     println("${snmpv3.in_window_authoritative(5, 1000, 5, 1100)} ${snmpv3.in_window_authoritative(5, 1000, 5, 1200)}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn in_window_authoritative(local_boots: Int, local_time: Int, msg_boots: Int, msg_time: Int) -> Bool []
+    if local_boots == SNMP_BOOTS_MAX or msg_boots != local_boots
+        return false
+    msg_time >= local_time - SNMP_TIME_WINDOW and msg_time <= local_time + SNMP_TIME_WINDOW
+
+// Judge a message from a remote authoritative engine against what is
+// known of its clock (RFC 3414 section 3.2 step 7b) and, when the message
+// is newer, record it in `sync`.  `now` is the engine's time as this
+// engine estimates it, in seconds.  Answers true when the message is
+// inside the time window.
+//
+// ```novo
+// use snmpv3
+//
+// fn main() [io]
+//     var s = snmpv3.SnmpEngineSync { boots: 3, time: 500, latest: 500 }
+//     println("${snmpv3.in_window_remote(var s, 500, 3, 520)} ${s.latest}")   // true 520
+// ```
+pub @tier(embedded)
+@no_alloc
+fn in_window_remote(var sync: SnmpEngineSync, now: Int, msg_boots: Int, msg_time: Int) -> Bool []
+    var local = now
+    if msg_boots > sync.boots or (msg_boots == sync.boots and msg_time > sync.latest)
+        sync.boots = msg_boots
+        sync.time = msg_time
+        sync.latest = msg_time
+        local = msg_time
+    if sync.boots == SNMP_BOOTS_MAX or msg_boots < sync.boots
+        return false
+    not (msg_boots == sync.boots and msg_time < local - SNMP_TIME_WINDOW)

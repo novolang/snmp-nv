@@ -1,0 +1,874 @@
+// snmppdu.nv — the PDUs of RFC 3416, the variable bindings and the
+// SNMPv1 and SNMPv2c messages around them, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+//
+// THE PDUS.  RFC 3416 section 3 defines eight PDU types, each a context
+// tag over the same shape: a request-id, two integers and a list of
+// variable bindings.
+//
+//   GetRequest      0xA0   GetNextRequest  0xA1   Response   0xA2
+//   SetRequest      0xA3   (0xA4 is the SNMPv1 Trap, a different shape)
+//   GetBulkRequest  0xA5   InformRequest   0xA6   SNMPv2-Trap 0xA7
+//   Report          0xA8
+//
+// In a request the two integers are 0.  In a Response they are the
+// error-status and the error-index.  In a GetBulkRequest they are the
+// non-repeaters and the max-repetitions (RFC 3416 section 4.2.3), and
+// this package keeps them in the same two fields, `error_status` and
+// `error_index`, which `SnmpPdu` documents.
+//
+// A VARIABLE BINDING is a name, an object identifier, and a value.  The
+// value is one of the SMIv2 types of RFC 2578 section 7.1 or, in a
+// Response, one of the three exceptions of RFC 3416 section 4.2.1:
+// noSuchObject, noSuchInstance and endOfMibView.  A request carries NULL.
+// An integer-like value is held in `num`.  A value that is a run of bytes
+// (an OCTET STRING, an Opaque, the contents of an OBJECT IDENTIFIER) is
+// held as a SPAN, `off` and `len`, into a buffer the caller owns: the
+// datagram for a PDU that was read, and a pool of values the caller
+// builds for a PDU that is written.  This is why the functions that read
+// or write a PDU take a second buffer.
+//
+// THE MESSAGES.  An SNMPv1 or SNMPv2c message is a sequence of the
+// version (0 or 1), the community string and a PDU (RFC 1157 section 4,
+// RFC 3584).  SNMPv3 is `snmpv3`.
+
+use snmpber
+use snmperr
+use snmpoid
+
+// The most variable bindings a PDU holds here: 8.
+pub const SNMP_VARBINDS_MAX = 8
+
+// SNMPv1, the version number 0.
+pub const SNMP_V1 = 0
+// SNMPv2c, the version number 1.
+pub const SNMP_V2C = 1
+// SNMPv3, the version number 3.
+pub const SNMP_V3 = 3
+
+// GetRequest-PDU: 0xA0.
+pub const SNMP_PDU_GET = 0xA0
+// GetNextRequest-PDU: 0xA1.
+pub const SNMP_PDU_GET_NEXT = 0xA1
+// Response-PDU: 0xA2.
+pub const SNMP_PDU_RESPONSE = 0xA2
+// SetRequest-PDU: 0xA3.
+pub const SNMP_PDU_SET = 0xA3
+// The SNMPv1 Trap-PDU, which has its own shape (RFC 1157 section 4.1.6):
+// 0xA4.
+pub const SNMP_PDU_TRAP_V1 = 0xA4
+// GetBulkRequest-PDU: 0xA5.
+pub const SNMP_PDU_GET_BULK = 0xA5
+// InformRequest-PDU: 0xA6.
+pub const SNMP_PDU_INFORM = 0xA6
+// SNMPv2-Trap-PDU: 0xA7.
+pub const SNMP_PDU_TRAP_V2 = 0xA7
+// Report-PDU: 0xA8.
+pub const SNMP_PDU_REPORT = 0xA8
+
+// The value is NULL: 0.  Requests carry it.
+pub const SNMP_V_NULL = 0
+// Integer32: 1.
+pub const SNMP_V_INTEGER = 1
+// OCTET STRING: 2.  A span.
+pub const SNMP_V_OCTETS = 2
+// OBJECT IDENTIFIER: 3.  A span over the contents of the identifier;
+// `snmpoid.oid_read` reads it.
+pub const SNMP_V_OID = 3
+// IpAddress: 4.  Four octets, held in `num`, first octet highest.
+pub const SNMP_V_IPADDRESS = 4
+// Counter32: 5.
+pub const SNMP_V_COUNTER32 = 5
+// Gauge32 and Unsigned32: 6.
+pub const SNMP_V_GAUGE32 = 6
+// TimeTicks, hundredths of a second: 7.
+pub const SNMP_V_TIMETICKS = 7
+// Opaque: 8.  A span.
+pub const SNMP_V_OPAQUE = 8
+// Counter64: 9.  The 64 bits are in `num`, a negative `Int` standing for
+// a value of 2^63 or more.
+pub const SNMP_V_COUNTER64 = 9
+// The exception noSuchObject: 10.
+pub const SNMP_V_NO_SUCH_OBJECT = 10
+// The exception noSuchInstance: 11.
+pub const SNMP_V_NO_SUCH_INSTANCE = 11
+// The exception endOfMibView: 12.
+pub const SNMP_V_END_OF_MIB_VIEW = 12
+
+// One variable binding.
+pub @value
+struct SnmpVarbind
+    // The name.
+    oid: SnmpOid
+    // One of the `SNMP_V_` kinds.
+    kind: Int
+    // The value of an Integer32, IpAddress, Counter32, Gauge32,
+    // TimeTicks or Counter64.
+    num: Int
+    // For an OCTET STRING, Opaque or OBJECT IDENTIFIER, where the bytes
+    // start in the buffer the value lives in.
+    off: Int
+    // How many bytes.
+    len: Int
+
+// A PDU.
+pub @value
+struct SnmpPdu
+    // One of the `SNMP_PDU_` tags.
+    tag: Int
+    // The request-id: a 32-bit signed integer.
+    request_id: Int
+    // The error-status of a Response, or the non-repeaters of a
+    // GetBulkRequest.
+    error_status: Int
+    // The error-index of a Response, or the max-repetitions of a
+    // GetBulkRequest.
+    error_index: Int
+    // The variable bindings, `vbs.len()` of them.
+    vbs: Vec[SnmpVarbind; SNMP_VARBINDS_MAX]
+
+// The SNMPv1 Trap-PDU (RFC 1157 section 4.1.6).
+pub @value
+struct SnmpTrap1
+    // The sysObjectID of the entity that sent it.
+    enterprise: SnmpOid
+    // The agent's IpAddress, first octet highest.
+    agent_addr: Int
+    // coldStart 0, warmStart 1, linkDown 2, linkUp 3,
+    // authenticationFailure 4, egpNeighborLoss 5, enterpriseSpecific 6.
+    generic: Int
+    // The enterprise's own trap number.
+    specific: Int
+    // sysUpTime when it was sent, in hundredths of a second.
+    timestamp: Int
+    // The variable bindings.
+    binds: SnmpPdu
+
+// What was read from the outside of a v1 or v2c message.
+pub @value
+struct SnmpMsgInfo
+    // `SNMP_V1` or `SNMP_V2C`.
+    version: Int
+    // Where the community string starts in the datagram.
+    comm_off: Int
+    // The length of the community string.
+    comm_len: Int
+    // The tag of the PDU: `SNMP_PDU_TRAP_V1` calls for `trap1_decode`,
+    // any other for `pdu_decode`.
+    pdu_tag: Int
+    // Where the PDU's identifier octet is in the datagram.
+    pdu_off: Int
+    // One past the last byte of the PDU.
+    pdu_end: Int
+
+// A variable binding with a NULL value and no name.
+@tier(embedded)
+@no_alloc
+fn varbind_empty() -> SnmpVarbind []
+    SnmpVarbind { oid: snmpoid.oid_empty(), kind: SNMP_V_NULL, num: 0, off: 0, len: 0 }
+
+// A PDU with no variable bindings, the given tag and request-id, and both
+// integers 0.
+//
+// ```novo
+// use snmppdu
+//
+// fn main() [io]
+//     let p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 42)
+//     println("${p.tag} ${p.request_id} ${p.vbs.len()}")   // 160 42 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pdu_new(tag: Int, request_id: Int) -> SnmpPdu []
+    SnmpPdu { tag: tag, request_id: request_id, error_status: 0, error_index: 0, vbs: Vec.new() }
+
+// Append a variable binding whose value is `kind` with the given number
+// and span.  Answers false when the PDU already has `SNMP_VARBINDS_MAX`.
+@tier(embedded)
+@no_alloc
+fn add(var p: SnmpPdu, var name: SnmpOid, kind: Int, num: Int, off: Int, len: Int) -> Bool []
+    match p.vbs.push(SnmpVarbind { oid: name, kind: kind, num: num, off: off, len: len })
+        Ok(_)  => true
+        Err(_) => false
+
+// Append a variable binding with a NULL value, as a GetRequest,
+// GetNextRequest or GetBulkRequest carries.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")
+//     println("${snmppdu.add_null(var p, var o)} ${p.vbs.len()}")   // true 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn add_null(var p: SnmpPdu, var name: SnmpOid) -> Bool []
+    add(var p, var name, SNMP_V_NULL, 0, 0, 0)
+
+// Append a variable binding with an Integer32 value, for a SetRequest.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_SET, 1)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.2.2.1.7.1")
+//     println("${snmppdu.add_integer(var p, var o, 2)}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn add_integer(var p: SnmpPdu, var name: SnmpOid, v: Int) -> Bool []
+    add(var p, var name, SNMP_V_INTEGER, v, 0, 0)
+
+// Append a variable binding of one of the unsigned kinds, `SNMP_V_COUNTER32`,
+// `SNMP_V_GAUGE32`, `SNMP_V_TIMETICKS`, `SNMP_V_COUNTER64`, or
+// `SNMP_V_IPADDRESS`.  Answers false for any other kind.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_SET, 1)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.3.0")
+//     println("${snmppdu.add_number(var p, var o, snmppdu.SNMP_V_TIMETICKS, 100)}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn add_number(var p: SnmpPdu, var name: SnmpOid, kind: Int, v: Int) -> Bool []
+    if kind != SNMP_V_COUNTER32 and kind != SNMP_V_GAUGE32 and kind != SNMP_V_TIMETICKS
+        and kind != SNMP_V_COUNTER64 and kind != SNMP_V_IPADDRESS
+        return false
+    add(var p, var name, kind, v, 0, 0)
+
+// Append a variable binding whose value is bytes in a pool: `kind` is
+// `SNMP_V_OCTETS`, `SNMP_V_OPAQUE` or `SNMP_V_OID`, and the bytes are
+// `len` from `off` in the buffer given to `pdu_encode`.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     let off = snmppdu.pool_add_str(var pool, "router-1")
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_SET, 1)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.5.0")
+//     println("${snmppdu.add_span(var p, var o, snmppdu.SNMP_V_OCTETS, off, 8)}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn add_span(var p: SnmpPdu, var name: SnmpOid, kind: Int, off: Int, len: Int) -> Bool []
+    if kind != SNMP_V_OCTETS and kind != SNMP_V_OPAQUE and kind != SNMP_V_OID
+        return false
+    add(var p, var name, kind, 0, off, len)
+
+// Append the bytes of a string to a pool and answer where they start, or
+// -1 when the pool is full.  The length is `str.len(s)`.
+//
+// ```novo
+// use snmppdu
+// use snmpber
+//
+// fn main() [io]
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     println("${snmppdu.pool_add_str(var pool, "ab")} ${snmppdu.pool_add_str(var pool, "cd")}")   // 0 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pool_add_str(var pool: SnmpBuf, s: Str) -> Int []
+    let at = pool.len()
+    for i in 0..str.len(s)
+        if not snmpber.put_byte(var pool, str.byte_at_or(s, i, 0))
+            return -1
+    at
+
+// Append the contents of an object identifier to a pool and answer where
+// they start, or -1 when it cannot be encoded or the pool is full.  The
+// length is `snmpoid.oid_content_len`.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1")
+//     println("${snmppdu.pool_add_oid(var pool, var o)} ${pool.len()}")   // 0 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pool_add_oid(var pool: SnmpBuf, var o: SnmpOid) -> Int []
+    let at = pool.len()
+    var scratch: SnmpBuf = Vec.new()
+    if not snmpoid.oid_put(var scratch, snmpber.SNMP_TAG_OID, var o)
+        return -1
+    let hdr = scratch.len() - snmpoid.oid_content_len(var o)
+    for i in hdr..scratch.len()
+        if not snmpber.put_byte(var pool, scratch[i] as Int)
+            return -1
+    at
+
+// Write the value of a variable binding.
+@tier(embedded)
+@no_alloc
+fn put_value(var out: SnmpBuf, vb: SnmpVarbind, var pool: SnmpBuf) -> Bool []
+    let k = vb.kind
+    if k == SNMP_V_NULL
+        return snmpber.put_head(var out, snmpber.SNMP_TAG_NULL, 0)
+    if k == SNMP_V_INTEGER
+        return vb.num >= -2147483648 and vb.num <= 2147483647
+            and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, vb.num)
+    if k == SNMP_V_OCTETS
+        return snmpber.put_span(var out, snmpber.SNMP_TAG_OCTET_STRING, var pool, vb.off, vb.len)
+    if k == SNMP_V_OPAQUE
+        return snmpber.put_span(var out, snmpber.SNMP_TAG_OPAQUE, var pool, vb.off, vb.len)
+    if k == SNMP_V_OID
+        return vb.len > 0 and snmpber.put_span(var out, snmpber.SNMP_TAG_OID, var pool, vb.off, vb.len)
+    if k == SNMP_V_IPADDRESS
+        var ok = vb.num >= 0 and vb.num <= 4294967295 and snmpber.put_head(var out, snmpber.SNMP_TAG_IPADDRESS, 4)
+        for i in 0..4
+            ok = ok and snmpber.put_byte(var out, vb.num >>> (8 * (3 - i)))
+        return ok
+    if k == SNMP_V_COUNTER32 or k == SNMP_V_GAUGE32 or k == SNMP_V_TIMETICKS
+        return vb.num >= 0 and vb.num <= 4294967295 and snmpber.put_unsigned(var out, tag_of(k), vb.num)
+    if k == SNMP_V_COUNTER64
+        return snmpber.put_unsigned(var out, snmpber.SNMP_TAG_COUNTER64, vb.num)
+    if k == SNMP_V_NO_SUCH_OBJECT
+        return snmpber.put_head(var out, snmpber.SNMP_TAG_NO_SUCH_OBJECT, 0)
+    if k == SNMP_V_NO_SUCH_INSTANCE
+        return snmpber.put_head(var out, snmpber.SNMP_TAG_NO_SUCH_INSTANCE, 0)
+    if k == SNMP_V_END_OF_MIB_VIEW
+        return snmpber.put_head(var out, snmpber.SNMP_TAG_END_OF_MIB_VIEW, 0)
+    false
+
+// The BER tag of one of the three 32-bit unsigned kinds.
+@tier(embedded)
+@no_alloc
+fn tag_of(kind: Int) -> Int []
+    if kind == SNMP_V_COUNTER32
+        return snmpber.SNMP_TAG_COUNTER32
+    if kind == SNMP_V_GAUGE32
+        return snmpber.SNMP_TAG_GAUGE32
+    snmpber.SNMP_TAG_TIMETICKS
+
+// Write the variable-bindings list: a sequence of sequences of a name and
+// a value.
+@tier(embedded)
+@no_alloc
+fn put_varbinds(var out: SnmpBuf, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
+    let list_mark = snmpber.begin(var out)
+    var ok = true
+    for i in 0..p.vbs.len()
+        let m = snmpber.begin(var out)
+        ok = ok and snmpoid.oid_put(var out, snmpber.SNMP_TAG_OID, var p.vbs[i].oid)
+        ok = ok and put_value(var out, p.vbs[i], var pool)
+        ok = ok and snmpber.end(var out, m, snmpber.SNMP_TAG_SEQUENCE)
+    ok and snmpber.end(var out, list_mark, snmpber.SNMP_TAG_SEQUENCE)
+
+// Append a PDU to `out`: its tag, the request-id, the two integers and
+// the variable bindings.  `pool` holds the bytes of the values that are
+// spans.  Answers false when a value is out of range for its kind, a span
+// lies outside the pool, a name cannot be encoded, or the buffer is full;
+// `out` then holds a partial PDU and is to be cleared.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")
+//     let _y = snmppdu.add_null(var p, var o)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     println("${snmppdu.pdu_encode(var out, var p, var pool)} ${out.len()}")   // true 29
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pdu_encode(var out: SnmpBuf, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
+    if p.tag < SNMP_PDU_GET or p.tag > SNMP_PDU_REPORT or p.tag == SNMP_PDU_TRAP_V1
+        return false
+    let mark = snmpber.begin(var out)
+    var ok = snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, p.request_id)
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, p.error_status)
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, p.error_index)
+    ok = ok and put_varbinds(var out, var p, var pool)
+    ok and snmpber.end(var out, mark, p.tag)
+
+// Append a whole v1 or v2c message: the version, the community string and
+// the PDU.  `version` is `SNMP_V1` or `SNMP_V2C`.  A v1 message cannot
+// carry GetBulkRequest, InformRequest, SNMPv2-Trap or Report (RFC 3584
+// section 3.1), and answers false.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")
+//     let _y = snmppdu.add_null(var p, var o)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     println("${snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "public", var p, var pool)} ${out.len()}")   // true 43
+// ```
+pub @tier(embedded)
+@no_alloc
+fn msg_encode(var out: SnmpBuf, version: Int, community: Str, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
+    var name: SnmpName = Vec.new()
+    snmpber.name_set(var name, community) and msg_encode_name(var out, version, var name, var p, var pool)
+
+// Append a whole v1 or v2c message whose community string is a name, as
+// `msg_encode` does for a string.
+//
+// ```novo
+// use snmppdu
+// use snmpber
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+//     var n: snmpber.SnmpName = Vec.new()
+//     let _x = snmpber.name_set(var n, "public")
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     println("${snmppdu.msg_encode_name(var out, snmppdu.SNMP_V2C, var n, var p, var pool)} ${out.len()}")   // true 28
+// ```
+pub @tier(embedded)
+@no_alloc
+fn msg_encode_name(var out: SnmpBuf, version: Int, var community: SnmpName, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
+    if version != SNMP_V1 and version != SNMP_V2C
+        return false
+    if version == SNMP_V1 and (p.tag == SNMP_PDU_GET_BULK or p.tag == SNMP_PDU_INFORM
+                               or p.tag == SNMP_PDU_TRAP_V2 or p.tag == SNMP_PDU_REPORT)
+        return false
+    let mark = snmpber.begin(var out)
+    var ok = snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, version)
+    ok = ok and snmpber.put_name(var out, var community)
+    ok = ok and pdu_encode(var out, var p, var pool)
+    ok and snmpber.end(var out, mark, snmpber.SNMP_TAG_SEQUENCE)
+
+// Append a whole SNMPv1 message carrying a Trap-PDU.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var e = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var e, "1.3.6.1.4.1.9")
+//     var t = snmppdu.trap1_new(var e, 0, 6, 1, 0)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     println("${snmppdu.trap1_encode(var out, "public", var t, var pool)}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn trap1_encode(var out: SnmpBuf, community: Str, var t: SnmpTrap1, var pool: SnmpBuf) -> Bool []
+    if t.generic < 0 or t.specific < 0 or t.timestamp < 0 or t.timestamp > 4294967295 or t.agent_addr < 0
+        or t.agent_addr > 4294967295
+        return false
+    let mark = snmpber.begin(var out)
+    var ok = snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, SNMP_V1)
+    ok = ok and snmpber.put_str(var out, snmpber.SNMP_TAG_OCTET_STRING, community)
+    let pdu = snmpber.begin(var out)
+    ok = ok and snmpoid.oid_put(var out, snmpber.SNMP_TAG_OID, var t.enterprise)
+    ok = ok and snmpber.put_head(var out, snmpber.SNMP_TAG_IPADDRESS, 4)
+    for i in 0..4
+        ok = ok and snmpber.put_byte(var out, t.agent_addr >>> (8 * (3 - i)))
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, t.generic)
+    ok = ok and snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, t.specific)
+    ok = ok and snmpber.put_unsigned(var out, snmpber.SNMP_TAG_TIMETICKS, t.timestamp)
+    ok = ok and put_varbinds(var out, var t.binds, var pool)
+    ok = ok and snmpber.end(var out, pdu, SNMP_PDU_TRAP_V1)
+    ok and snmpber.end(var out, mark, snmpber.SNMP_TAG_SEQUENCE)
+
+// A Trap-PDU with no name, no variable bindings and every number 0: the
+// value `trap1_decode` fills in.
+//
+// ```novo
+// use snmppdu
+//
+// fn main() [io]
+//     let t = snmppdu.trap1_empty()
+//     println("${t.generic} ${t.binds.vbs.len()}")   // 0 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn trap1_empty() -> SnmpTrap1 []
+    SnmpTrap1 { enterprise: snmpoid.oid_empty(), agent_addr: 0, generic: 0, specific: 0, timestamp: 0,
+                binds: pdu_new(SNMP_PDU_TRAP_V1, 0) }
+
+// A Trap-PDU with the given fields and no variable bindings; the caller
+// adds them with `add_null`, `add_integer` and the others, to `binds`.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+//
+// fn main() [io]
+//     var e = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var e, "1.3.6.1.4.1.9")
+//     var t = snmppdu.trap1_new(var e, 167772161, 6, 1, 100)
+//     println("${t.generic} ${t.specific} ${t.binds.vbs.len()}")   // 6 1 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn trap1_new(var enterprise: SnmpOid, agent_addr: Int, generic: Int, specific: Int, timestamp: Int) -> SnmpTrap1 []
+    SnmpTrap1 { enterprise: enterprise, agent_addr: agent_addr, generic: generic, specific: specific,
+                timestamp: timestamp, binds: pdu_new(SNMP_PDU_TRAP_V1, 0) }
+
+// Read the value at `at`, whose header is `h`, into the binding.
+@tier(embedded)
+@no_alloc
+fn read_value(var b: SnmpBuf, at: Int, h: SnmpHead, var vb: SnmpVarbind) -> Int []
+    let body = at + h.hdr
+    let t = h.tag
+    vb.off = body
+    vb.len = h.len
+    if t == snmpber.SNMP_TAG_NULL
+        vb.kind = SNMP_V_NULL
+        return if h.len == 0 then snmperr.SNMP_OK else snmperr.SNMP_E_BAD_VALUE
+    if t == snmpber.SNMP_TAG_INTEGER
+        let n = snmpber.read_integer(var b, body, h.len)
+        vb.kind = SNMP_V_INTEGER
+        vb.num = n.value
+        return if n.ok and n.value >= -2147483648 and n.value <= 2147483647 then snmperr.SNMP_OK else snmperr.SNMP_E_BAD_INTEGER
+    if t == snmpber.SNMP_TAG_OCTET_STRING or t == snmpber.SNMP_TAG_OPAQUE
+        vb.kind = if t == snmpber.SNMP_TAG_OPAQUE then SNMP_V_OPAQUE else SNMP_V_OCTETS
+        return snmperr.SNMP_OK
+    if t == snmpber.SNMP_TAG_OID
+        vb.kind = SNMP_V_OID
+        return if h.len > 0 and (b[body + h.len - 1] as Int) < 128 then snmperr.SNMP_OK else snmperr.SNMP_E_BAD_OID
+    if t == snmpber.SNMP_TAG_IPADDRESS
+        vb.kind = SNMP_V_IPADDRESS
+        if h.len != 4
+            return snmperr.SNMP_E_BAD_VALUE
+        vb.num = ((b[body] as Int) << 24) | ((b[body + 1] as Int) << 16) | ((b[body + 2] as Int) << 8) | (b[body + 3] as Int)
+        return snmperr.SNMP_OK
+    if t == snmpber.SNMP_TAG_COUNTER32 or t == snmpber.SNMP_TAG_GAUGE32 or t == snmpber.SNMP_TAG_TIMETICKS
+        let n = snmpber.read_unsigned(var b, body, h.len, 32)
+        vb.kind = if t == snmpber.SNMP_TAG_COUNTER32 then SNMP_V_COUNTER32 else (if t == snmpber.SNMP_TAG_GAUGE32 then SNMP_V_GAUGE32 else SNMP_V_TIMETICKS)
+        vb.num = n.value
+        return if n.ok then snmperr.SNMP_OK else snmperr.SNMP_E_BAD_INTEGER
+    if t == snmpber.SNMP_TAG_COUNTER64
+        let n = snmpber.read_unsigned(var b, body, h.len, 64)
+        vb.kind = SNMP_V_COUNTER64
+        vb.num = n.value
+        return if n.ok then snmperr.SNMP_OK else snmperr.SNMP_E_BAD_INTEGER
+    if t == snmpber.SNMP_TAG_NO_SUCH_OBJECT or t == snmpber.SNMP_TAG_NO_SUCH_INSTANCE or t == snmpber.SNMP_TAG_END_OF_MIB_VIEW
+        vb.kind = SNMP_V_NO_SUCH_OBJECT + (t - snmpber.SNMP_TAG_NO_SUCH_OBJECT)
+        return if h.len == 0 then snmperr.SNMP_OK else snmperr.SNMP_E_BAD_VALUE
+    snmperr.SNMP_E_BAD_VALUE
+
+// Read the variable-bindings list at `at` into the PDU, ending at or
+// before `limit`.  Answers `SNMP_OK` and sets `end` to one past the list.
+@tier(embedded)
+@no_alloc
+fn read_varbinds(var b: SnmpBuf, at: Int, limit: Int, var p: SnmpPdu) -> Int []
+    p.vbs.clear()
+    let lh = snmpber.read_head(var b, at, limit)
+    if not lh.ok
+        return lh.code
+    if lh.tag != snmpber.SNMP_TAG_SEQUENCE
+        return snmperr.SNMP_E_BAD_TAG
+    var pos = at + lh.hdr
+    let end = pos + lh.len
+    for _i in 0..SNMP_VARBINDS_MAX + 1
+        if pos < end
+            let vh = snmpber.read_head(var b, pos, end)
+            if not vh.ok
+                return vh.code
+            if vh.tag != snmpber.SNMP_TAG_SEQUENCE
+                return snmperr.SNMP_E_BAD_TAG
+            let vend = pos + vh.hdr + vh.len
+            let nh = snmpber.read_head(var b, pos + vh.hdr, vend)
+            if not nh.ok
+                return nh.code
+            if nh.tag != snmpber.SNMP_TAG_OID
+                return snmperr.SNMP_E_BAD_TAG
+            var vb = varbind_empty()
+            let oc = snmpoid.oid_read(var b, pos + vh.hdr + nh.hdr, nh.len, var vb.oid)
+            if oc != snmperr.SNMP_OK
+                return oc
+            let valpos = pos + vh.hdr + nh.hdr + nh.len
+            let valh = snmpber.read_head(var b, valpos, vend)
+            if not valh.ok
+                return valh.code
+            if valpos + valh.hdr + valh.len != vend
+                return snmperr.SNMP_E_BAD_LENGTH
+            let rc = read_value(var b, valpos, valh, var vb)
+            if rc != snmperr.SNMP_OK
+                return rc
+            match p.vbs.push(vb)
+                Ok(_)  => 0
+                Err(_) => return snmperr.SNMP_E_TOO_MANY_VARBINDS
+            pos = vend
+    snmperr.SNMP_OK
+
+// Read one INTEGER of 32 bits at `at`, answering the position after it
+// in `next`, or a negative error code.
+@tier(embedded)
+@no_alloc
+fn read_int32(var b: SnmpBuf, at: Int, limit: Int, var out: Vec[Int; 2]) -> Int []
+    let h = snmpber.read_head(var b, at, limit)
+    if not h.ok
+        return h.code
+    if h.tag != snmpber.SNMP_TAG_INTEGER
+        return snmperr.SNMP_E_BAD_TAG
+    let n = snmpber.read_integer(var b, at + h.hdr, h.len)
+    if not n.ok or n.value < -2147483648 or n.value > 2147483647
+        return snmperr.SNMP_E_BAD_INTEGER
+    out.clear()
+    let _a = out.push(n.value)
+    let _b = out.push(at + h.hdr + h.len)
+    snmperr.SNMP_OK
+
+// Read the PDU whose identifier octet is at `at` and which ends at or
+// before `limit`, into `p`.  The tag may be any of the PDU tags except
+// the SNMPv1 Trap-PDU, which `trap1_decode` reads.  Answers `SNMP_OK` or
+// the code of the first fault: `SNMP_E_TRUNCATED`, `SNMP_E_BAD_TAG`,
+// `SNMP_E_BAD_LENGTH` when something does not fill its container,
+// `SNMP_E_BAD_INTEGER`, `SNMP_E_BAD_OID`, `SNMP_E_OID_TOO_LONG`,
+// `SNMP_E_BAD_VALUE` or `SNMP_E_TOO_MANY_VARBINDS`.  The spans in `p`
+// are offsets into `b`.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 7)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")
+//     let _y = snmppdu.add_null(var p, var o)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     let _z = snmppdu.pdu_encode(var out, var p, var pool)
+//     var q = snmppdu.pdu_new(0, 0)
+//     println("${snmppdu.pdu_decode(var out, 0, out.len(), var q)} ${q.request_id}")   // 0 7
+// ```
+pub @tier(embedded)
+@no_alloc
+fn pdu_decode(var b: SnmpBuf, at: Int, limit: Int, var p: SnmpPdu) -> Int []
+    let h = snmpber.read_head(var b, at, limit)
+    if not h.ok
+        return h.code
+    if h.tag < SNMP_PDU_GET or h.tag > SNMP_PDU_REPORT or h.tag == SNMP_PDU_TRAP_V1
+        return snmperr.SNMP_E_BAD_TAG
+    let end = at + h.hdr + h.len
+    var pos = at + h.hdr
+    var r: Vec[Int; 2] = Vec.new()
+    var c = read_int32(var b, pos, end, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    p.tag = h.tag
+    p.request_id = r[0]
+    pos = r[1]
+    c = read_int32(var b, pos, end, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    p.error_status = r[0]
+    pos = r[1]
+    c = read_int32(var b, pos, end, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    p.error_index = r[0]
+    c = read_varbinds(var b, r[1], end, var p)
+    if c != snmperr.SNMP_OK
+        return c
+    let lh = snmpber.read_head(var b, r[1], end)
+    if r[1] + lh.hdr + lh.len != end
+        return snmperr.SNMP_E_BAD_LENGTH
+    snmperr.SNMP_OK
+
+// Read the outside of a v1 or v2c message: the version, the community
+// string and where the PDU is.  The whole datagram, `b.len()` bytes, must
+// be the message.  Answers `SNMP_OK`, `SNMP_E_BAD_VERSION` for a version
+// other than 0 and 1, and the faults of `read_head`.  The PDU is read by
+// `pdu_decode`, or by `trap1_decode` when `pdu_tag` is
+// `SNMP_PDU_TRAP_V1`.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")
+//     let _y = snmppdu.add_null(var p, var o)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     let _z = snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "public", var p, var pool)
+//     var info = snmppdu.info_new()
+//     println("${snmppdu.msg_decode(var out, var info)} ${info.version} ${info.comm_len}")   // 0 1 6
+// ```
+pub @tier(embedded)
+@no_alloc
+fn msg_decode(var b: SnmpBuf, var info: SnmpMsgInfo) -> Int []
+    let h = snmpber.read_head(var b, 0, b.len())
+    if not h.ok
+        return h.code
+    if h.tag != snmpber.SNMP_TAG_SEQUENCE
+        return snmperr.SNMP_E_BAD_TAG
+    if h.hdr + h.len != b.len()
+        return snmperr.SNMP_E_BAD_LENGTH
+    var r: Vec[Int; 2] = Vec.new()
+    var c = read_int32(var b, h.hdr, b.len(), var r)
+    if c != snmperr.SNMP_OK
+        return c
+    if r[0] != SNMP_V1 and r[0] != SNMP_V2C
+        return snmperr.SNMP_E_BAD_VERSION
+    info.version = r[0]
+    let ch = snmpber.read_head(var b, r[1], b.len())
+    if not ch.ok
+        return ch.code
+    if ch.tag != snmpber.SNMP_TAG_OCTET_STRING
+        return snmperr.SNMP_E_BAD_TAG
+    info.comm_off = r[1] + ch.hdr
+    info.comm_len = ch.len
+    let pos = r[1] + ch.hdr + ch.len
+    let ph = snmpber.read_head(var b, pos, b.len())
+    if not ph.ok
+        return ph.code
+    info.pdu_tag = ph.tag
+    info.pdu_off = pos
+    info.pdu_end = pos + ph.hdr + ph.len
+    if info.pdu_end != b.len()
+        return snmperr.SNMP_E_BAD_LENGTH
+    snmperr.SNMP_OK
+
+// A message description with every field 0.
+//
+// ```novo
+// use snmppdu
+//
+// fn main() [io]
+//     let i = snmppdu.info_new()
+//     println("${i.version}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn info_new() -> SnmpMsgInfo []
+    SnmpMsgInfo { version: 0, comm_off: 0, comm_len: 0, pdu_tag: 0, pdu_off: 0, pdu_end: 0 }
+
+// Whether the community string of a message equals `community`.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     let _z = snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "public", var p, var pool)
+//     var info = snmppdu.info_new()
+//     let _c = snmppdu.msg_decode(var out, var info)
+//     println("${snmppdu.community_is(var out, info, "public")}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn community_is(var b: SnmpBuf, info: SnmpMsgInfo, community: Str) -> Bool []
+    if info.comm_len != str.len(community) or info.comm_off + info.comm_len > b.len()
+        return false
+    var same = true
+    for i in 0..info.comm_len
+        same = same and (b[info.comm_off + i] as Int) == str.byte_at_or(community, i, 0)
+    same
+
+// Read the Trap-PDU of an SNMPv1 message whose `pdu_tag` is
+// `SNMP_PDU_TRAP_V1`, into `t`.  Answers `SNMP_OK` or the code of the first
+// fault, as `pdu_decode` does.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmpber
+//
+// fn main() [io]
+//     var e = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var e, "1.3.6.1.4.1.9")
+//     var t = snmppdu.trap1_new(var e, 0, 6, 1, 0)
+//     var out: snmpber.SnmpBuf = Vec.new()
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     let _w = snmppdu.trap1_encode(var out, "public", var t, var pool)
+//     var info = snmppdu.info_new()
+//     let _c = snmppdu.msg_decode(var out, var info)
+//     var u = snmppdu.trap1_empty()
+//     println("${snmppdu.trap1_decode(var out, info, var u)} ${u.generic}")   // 0 6
+// ```
+pub @tier(embedded)
+@no_alloc
+fn trap1_decode(var b: SnmpBuf, info: SnmpMsgInfo, var t: SnmpTrap1) -> Int []
+    if info.pdu_tag != SNMP_PDU_TRAP_V1 or info.version != SNMP_V1
+        return snmperr.SNMP_E_BAD_TAG
+    let h = snmpber.read_head(var b, info.pdu_off, info.pdu_end)
+    if not h.ok
+        return h.code
+    let end = info.pdu_end
+    var pos = info.pdu_off + h.hdr
+    let eh = snmpber.read_head(var b, pos, end)
+    if not eh.ok
+        return eh.code
+    if eh.tag != snmpber.SNMP_TAG_OID
+        return snmperr.SNMP_E_BAD_TAG
+    let oc = snmpoid.oid_read(var b, pos + eh.hdr, eh.len, var t.enterprise)
+    if oc != snmperr.SNMP_OK
+        return oc
+    pos = pos + eh.hdr + eh.len
+    let ah = snmpber.read_head(var b, pos, end)
+    if not ah.ok
+        return ah.code
+    if ah.tag != snmpber.SNMP_TAG_IPADDRESS or ah.len != 4
+        return snmperr.SNMP_E_BAD_VALUE
+    t.agent_addr = ((b[pos + ah.hdr] as Int) << 24) | ((b[pos + ah.hdr + 1] as Int) << 16)
+        | ((b[pos + ah.hdr + 2] as Int) << 8) | (b[pos + ah.hdr + 3] as Int)
+    pos = pos + ah.hdr + ah.len
+    var r: Vec[Int; 2] = Vec.new()
+    var c = read_int32(var b, pos, end, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    t.generic = r[0]
+    c = read_int32(var b, r[1], end, var r)
+    if c != snmperr.SNMP_OK
+        return c
+    t.specific = r[0]
+    let th = snmpber.read_head(var b, r[1], end)
+    if not th.ok
+        return th.code
+    if th.tag != snmpber.SNMP_TAG_TIMETICKS
+        return snmperr.SNMP_E_BAD_TAG
+    let tn = snmpber.read_unsigned(var b, r[1] + th.hdr, th.len, 32)
+    if not tn.ok
+        return snmperr.SNMP_E_BAD_INTEGER
+    t.timestamp = tn.value
+    let vpos = r[1] + th.hdr + th.len
+    c = read_varbinds(var b, vpos, end, var t.binds)
+    if c != snmperr.SNMP_OK
+        return c
+    let lh = snmpber.read_head(var b, vpos, end)
+    if vpos + lh.hdr + lh.len != end
+        return snmperr.SNMP_E_BAD_LENGTH
+    snmperr.SNMP_OK

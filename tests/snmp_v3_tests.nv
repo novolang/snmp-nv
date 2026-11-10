@@ -1,0 +1,415 @@
+// snmp_v3_tests.nv — the SNMPv3 message of RFC 3412 and the framing of
+// the User-based Security Model of RFC 3414, byte by byte.
+//
+// THE VECTORS ARE DERIVED BY HAND from the field lists of RFC 3412
+// section 6 and RFC 3414 section 2.4.  The sample of RFC 3414 appendix
+// A.4 prints its fields with real values, but its lengths do not agree
+// with its own octets: the engine ID is written `04 0c` and listed as
+// nine octets, and the sequence length 0x37 is four more than the fields
+// add up to.  So the vector below uses the same field values with a
+// twelve-octet engine ID and the lengths worked out in the comment.
+
+use std.test
+use snmpber
+use snmperr
+use snmppdu
+use snmpv3
+
+fn diff(var p: snmpber.SnmpBuf, want: [Int]) -> Int
+    if p.len() != list.len(want)
+        return -2
+    for i in 0..p.len()
+        if (p[i] as Int) != want[i]
+            return i
+    -1
+
+fn buf_of(xs: [Int]) -> snmpber.SnmpBuf
+    var b: snmpber.SnmpBuf = Vec.new()
+    for x in xs
+        let _ok = snmpber.put_byte(var b, x)
+    b
+
+fn name_of(s: Str) -> snmpber.SnmpName
+    var n: snmpber.SnmpName = Vec.new()
+    let _ok = snmpber.name_set(var n, s)
+    n
+
+// The USM parameters of the sample: the engine ID 80 00 00 02 01 09 84 03
+// 01 00 00 00, boots 1, time 257, the user "bert", twelve octets of
+// authentication parameters and eight of privacy parameters.
+fn sample_usm() -> SnmpUsm
+    var id: snmpber.SnmpName = Vec.new()
+    for x in [0x80, 0x00, 0x00, 0x02, 0x01, 0x09, 0x84, 0x03, 0x01, 0x00, 0x00, 0x00]
+        let _a = id.push(x as u8)
+    var auth: Vec[u8; 48] = Vec.new()
+    for x in [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98]
+        let _b = auth.push(x as u8)
+    var salt: Vec[u8; 8] = Vec.new()
+    for x in [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+        let _c = salt.push(x as u8)
+    SnmpUsm { engine_id: id, boots: 1, time: 257, user: name_of("bert"), auth_params: auth, priv_params: salt }
+
+// An empty-GetRequest scoped PDU: 30 11 | 04 00 | 04 00 | A0 0B ...
+fn plain_scoped() -> snmpber.SnmpBuf
+    var sc = snmpv3.scoped_empty()
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 7)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var pool: snmpber.SnmpBuf = Vec.new()
+    let _ok = snmpv3.scoped_encode(var out, var sc, var p, var pool)
+    out
+
+fn header(flags: Int) -> SnmpV3Header
+    SnmpV3Header { msg_id: 2, max_size: 1472, flags: flags, model: 3 }
+
+// The message of the sample with the given flags and data.
+fn sample_message(flags: Int, var data: snmpber.SnmpBuf, encrypted: Bool) -> snmpber.SnmpBuf
+    var out: snmpber.SnmpBuf = Vec.new()
+    var u = sample_usm()
+    var lay = snmpv3.layout_empty()
+    let _c = snmpv3.v3_encode(var out, header(flags), var u, var data, encrypted, var lay)
+    out
+
+@test
+fn test_engine_discovery_request_byte_by_byte() [io]
+    // version 02 01 03 (3); the global data 30 0D { 02 01 01, 02 02 05 C0,
+    // 04 01 04, 02 01 03 } (15): message ID 1, maximum size 1472 = 0x05C0,
+    // flags 04 (reportable only), model 3; the security parameters 04 10 30
+    // 0E { 04 00, 02 01 00, 02 01 00, 04 00, 04 00, 04 00 } (18), all
+    // empty; the scoped PDU 30 11 { 04 00, 04 00, A0 0B { 02 01 07, 02 01 00,
+    // 02 01 00, 30 00 } } (19).  The message holds 3 + 15 + 18 + 19 = 55,
+    // 30 37.
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpv3.discovery_request(var out, 1, 7))
+    test.assert_eq(diff(var out, [0x30, 0x37, 0x02, 0x01, 0x03,
+                                  0x30, 0x0D, 0x02, 0x01, 0x01, 0x02, 0x02, 0x05, 0xC0, 0x04, 0x01, 0x04, 0x02, 0x01, 0x03,
+                                  0x04, 0x10, 0x30, 0x0E, 0x04, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
+                                  0x04, 0x00, 0x04, 0x00, 0x04, 0x00,
+                                  0x30, 0x11, 0x04, 0x00, 0x04, 0x00, 0xA0, 0x0B, 0x02, 0x01, 0x07,
+                                  0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), -1)
+
+@test
+fn test_the_usm_sample_byte_by_byte() [io]
+    // The USM sequence: the engine ID 04 0C + 12 (14), boots 02 01 01 (3),
+    // time 02 02 01 01 (4), user 04 04 62 65 72 74 (6), authentication
+    // parameters 04 0C + 12 (14), privacy parameters 04 08 + 8 (10): 51,
+    // 30 33; in its octet string, 04 35.  The message is the version (3),
+    // the global data with message ID 2 and flags 05, authenticated and
+    // reportable (15), this (55) and the scoped PDU (19): 92, 30 5C.
+    var data = plain_scoped()
+    var out = sample_message(5, var data, false)
+    test.assert_eq(out.len(), 94)
+    test.assert_eq(diff(var out, [0x30, 0x5C, 0x02, 0x01, 0x03,
+                                  0x30, 0x0D, 0x02, 0x01, 0x02, 0x02, 0x02, 0x05, 0xC0, 0x04, 0x01, 0x05, 0x02, 0x01, 0x03,
+                                  0x04, 0x35, 0x30, 0x33,
+                                  0x04, 0x0C, 0x80, 0x00, 0x00, 0x02, 0x01, 0x09, 0x84, 0x03, 0x01, 0x00, 0x00, 0x00,
+                                  0x02, 0x01, 0x01, 0x02, 0x02, 0x01, 0x01, 0x04, 0x04, 0x62, 0x65, 0x72, 0x74,
+                                  0x04, 0x0C, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98,
+                                  0x04, 0x08, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+                                  0x30, 0x11, 0x04, 0x00, 0x04, 0x00, 0xA0, 0x0B, 0x02, 0x01, 0x07,
+                                  0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), -1)
+    test.case("the layout points at the digest and at the data")
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    test.assert_eq(lay.auth_off, 53)
+    test.assert_eq(lay.auth_len, 12)
+    test.assert_eq(lay.data_off, 75)
+    test.assert_eq(lay.body_off, 77)
+    test.assert_eq(lay.body_len, 17)
+    test.assert(not lay.encrypted)
+    test.assert_eq(out[lay.auth_off] as Int, 0x01)
+    test.assert_eq(out[lay.auth_off + 11] as Int, 0x98)
+    test.case("and the header and parameters read back")
+    test.assert_eq(h.msg_id, 2)
+    test.assert_eq(h.max_size, 1472)
+    test.assert_eq(h.flags, 5)
+    test.assert_eq(h.model, 3)
+    test.assert_eq(u.boots, 1)
+    test.assert_eq(u.time, 257)
+    test.assert_eq(u.engine_id.len(), 12)
+    test.assert_eq(u.user.len(), 4)
+    test.assert_eq(u.auth_params.len(), 12)
+    test.assert_eq(u.priv_params.len(), 8)
+    test.assert_eq(u.priv_params[7] as Int, 0xEF)
+
+@test
+fn test_an_encrypted_message() [io]
+    // With the privacy flag the data is an OCTET STRING holding the
+    // ciphertext: here 16 octets, so 04 10 + 16 and the flags are 07.
+    var cipher = buf_of([0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF])
+    var out = sample_message(7, var cipher, true)
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    test.assert(lay.encrypted)
+    test.assert_eq(lay.body_len, 16)
+    test.assert_eq(out[lay.data_off] as Int, 0x04)
+    test.assert_eq(out[lay.body_off] as Int, 0xA0)
+    test.assert_eq(h.flags, 7)
+
+@test
+fn test_a_header_that_cannot_be_written() [io]
+    var data = plain_scoped()
+    var out: snmpber.SnmpBuf = Vec.new()
+    var u = sample_usm()
+    var lay = snmpv3.layout_empty()
+    test.case("a message ID, size or model out of range")
+    for h in [SnmpV3Header { msg_id: -1, max_size: 1472, flags: 4, model: 3 },
+              SnmpV3Header { msg_id: 2147483648, max_size: 1472, flags: 4, model: 3 },
+              SnmpV3Header { msg_id: 1, max_size: 483, flags: 4, model: 3 },
+              SnmpV3Header { msg_id: 1, max_size: 2147483648, flags: 4, model: 3 },
+              SnmpV3Header { msg_id: 1, max_size: 1472, flags: 4, model: 0 },
+              SnmpV3Header { msg_id: 1, max_size: 1472, flags: 4, model: 2147483648 }]
+        out.clear()
+        test.assert_eq(snmpv3.v3_encode(var out, h, var u, var data, false, var lay), snmperr.SNMP_E_BAD_ARGUMENT)
+    test.case("privacy without authentication, and flags that disagree with the data")
+    out.clear()
+    test.assert_eq(snmpv3.v3_encode(var out, header(2), var u, var data, true, var lay), snmperr.SNMP_E_BAD_FLAGS)
+    test.assert_eq(snmpv3.v3_encode(var out, header(3), var u, var data, false, var lay), snmperr.SNMP_E_BAD_FLAGS)
+    test.assert_eq(snmpv3.v3_encode(var out, header(1), var u, var data, true, var lay), snmperr.SNMP_E_BAD_FLAGS)
+    test.assert_eq(snmpv3.v3_encode(var out, header(256), var u, var data, false, var lay), snmperr.SNMP_E_BAD_FLAGS)
+    test.assert_eq(snmpv3.v3_encode(var out, header(-1), var u, var data, false, var lay), snmperr.SNMP_E_BAD_FLAGS)
+    test.case("a full buffer")
+    for _i in 0..snmpber.SNMP_MSG_MAX
+        let _ok = snmpber.put_byte(var out, 0)
+    test.assert_eq(snmpv3.v3_encode(var out, header(5), var u, var data, false, var lay), snmperr.SNMP_E_NO_ROOM)
+
+// The sample message with one octet replaced.
+fn patched(flags: Int, at: Int, to: Int) -> snmpber.SnmpBuf
+    var data = plain_scoped()
+    var out = sample_message(flags, var data, false)
+    out[at] = to as u8
+    out
+
+fn decode_code(var b: snmpber.SnmpBuf) -> Int
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    snmpv3.v3_decode(var b, var h, var u, var lay)
+
+@test
+fn test_messages_that_are_refused() [io]
+    var good = patched(5, 2, 0x02)
+    test.assert_eq(decode_code(var good), snmperr.SNMP_OK)
+    test.case("a version that is not 3")
+    var a = patched(5, 4, 0x02)
+    test.assert_eq(decode_code(var a), snmperr.SNMP_E_BAD_VERSION)
+    test.case("a message ID or a maximum size out of range")
+    var b = patched(5, 9, 0x80)
+    test.assert_eq(decode_code(var b), snmperr.SNMP_E_BAD_HEADER)
+    var c = patched(5, 12, 0x01)
+    test.assert_eq(decode_code(var c), snmperr.SNMP_E_BAD_HEADER)
+    test.case("flags that are not one octet, or privacy without authentication")
+    var d = patched(5, 14, 0x02)
+    test.assert_eq(decode_code(var d), snmperr.SNMP_E_BAD_FLAGS)
+    var e = patched(5, 16, 0x02)
+    test.assert_eq(decode_code(var e), snmperr.SNMP_E_BAD_FLAGS)
+    test.case("a security model that is not the USM, or is 0")
+    var f = patched(5, 19, 0x02)
+    test.assert_eq(decode_code(var f), snmperr.SNMP_E_BAD_SECURITY_MODEL)
+    var g = patched(5, 19, 0x00)
+    test.assert_eq(decode_code(var g), snmperr.SNMP_E_BAD_HEADER)
+    test.case("the security parameters are not an octet string, nor hold a sequence")
+    var h = patched(5, 20, 0x30)
+    test.assert_eq(decode_code(var h), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    var i = patched(5, 22, 0x31)
+    test.assert_eq(decode_code(var i), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    test.case("an engine ID of 33 octets, a user name of 33, auth params of 49, privacy params of 9")
+    var j = patched(5, 25, 0x21)
+    test.assert_eq(decode_code(var j), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    var k = patched(5, 46, 0x21)
+    test.assert_eq(decode_code(var k), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    var l = patched(5, 52, 0x31)
+    test.assert_eq(decode_code(var l), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    var m = patched(5, 66, 0x09)
+    test.assert_eq(decode_code(var m), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    test.case("boots and time that are not integers or are negative")
+    var n = patched(5, 39, 0x04)
+    test.assert_eq(decode_code(var n), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    var o = patched(5, 42, 0x04)
+    test.assert_eq(decode_code(var o), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    var p = patched(5, 41, 0xFF)
+    test.assert_eq(decode_code(var p), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    test.case("data that is neither a sequence nor an octet string")
+    var q = patched(5, 75, 0x02)
+    test.assert_eq(decode_code(var q), snmperr.SNMP_E_BAD_TAG)
+    test.case("data whose length does not reach the end of the message")
+    var r = patched(5, 76, 0x10)
+    test.assert_eq(decode_code(var r), snmperr.SNMP_E_BAD_LENGTH)
+    test.case("a message whose first octet is not a sequence, and trailing octets")
+    var s = patched(5, 0, 0x31)
+    test.assert_eq(decode_code(var s), snmperr.SNMP_E_BAD_TAG)
+    var t = patched(5, 1, 0x5B)
+    test.assert_eq(decode_code(var t), snmperr.SNMP_E_BAD_LENGTH)
+    test.case("a message cut short at every point of its header")
+    var u = buf_of([])
+    test.assert_eq(decode_code(var u), snmperr.SNMP_E_TRUNCATED)
+    var v = buf_of([0x30, 0x03, 0x02, 0x01, 0x03])
+    test.assert_eq(decode_code(var v), snmperr.SNMP_E_TRUNCATED)
+    var w = buf_of([0x30, 0x04, 0x02, 0x01, 0x03, 0x04])
+    test.assert_eq(decode_code(var w), snmperr.SNMP_E_TRUNCATED)
+    var x = buf_of([0x30, 0x05, 0x02, 0x01, 0x03, 0x30, 0x00])
+    test.assert_eq(decode_code(var x), snmperr.SNMP_E_TRUNCATED)
+    test.case("the privacy flag set while the data is a sequence")
+    var y = patched(5, 16, 0x07)
+    test.assert_eq(decode_code(var y), snmperr.SNMP_E_BAD_FLAGS)
+    test.case("a text version where the integer is")
+    var z = patched(5, 2, 0x04)
+    test.assert_eq(decode_code(var z), snmperr.SNMP_E_BAD_TAG)
+
+// A message whose global data holds the given octets.
+fn with_global(content: [Int]) -> snmpber.SnmpBuf
+    var inner = buf_of(content)
+    var b: snmpber.SnmpBuf = Vec.new()
+    let m = snmpber.begin(var b)
+    let _a = snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 3)
+    let g = snmpber.begin(var b)
+    let _c = snmpber.put_raw(var b, var inner, 0, inner.len())
+    let _d = snmpber.end(var b, g, snmpber.SNMP_TAG_SEQUENCE)
+    let _e = snmpber.end(var b, m, snmpber.SNMP_TAG_SEQUENCE)
+    b
+
+@test
+fn test_header_pieces_that_are_cut_short_or_wrong() [io]
+    let id = [0x02, 0x01, 0x01]
+    let size = [0x02, 0x02, 0x05, 0xC0]
+    let flags = [0x04, 0x01, 0x04]
+    let model = [0x02, 0x01, 0x03]
+    test.case("a global sequence with every part is read as far as the security parameters")
+    var ok = with_global(list.concat(list.concat(id, size), list.concat(flags, model)))
+    test.assert_eq(decode_code(var ok), snmperr.SNMP_E_TRUNCATED)
+    test.case("each part missing or of the wrong type")
+    var a = with_global([0x04, 0x00])
+    test.assert_eq(decode_code(var a), snmperr.SNMP_E_BAD_TAG)
+    var b = with_global(id)
+    test.assert_eq(decode_code(var b), snmperr.SNMP_E_TRUNCATED)
+    var c = with_global(list.concat(id, [0x04, 0x00]))
+    test.assert_eq(decode_code(var c), snmperr.SNMP_E_BAD_TAG)
+    var d = with_global(list.concat(id, size))
+    test.assert_eq(decode_code(var d), snmperr.SNMP_E_TRUNCATED)
+    var e = with_global(list.concat(list.concat(id, size), [0x04, 0x01]))
+    test.assert_eq(decode_code(var e), snmperr.SNMP_E_TRUNCATED)
+    var f = with_global(list.concat(list.concat(id, size), flags))
+    test.assert_eq(decode_code(var f), snmperr.SNMP_E_TRUNCATED)
+    var g = with_global(list.concat(list.concat(id, size), list.concat(flags, [0x04, 0x01, 0x03])))
+    test.assert_eq(decode_code(var g), snmperr.SNMP_E_BAD_TAG)
+    test.case("an octet after the model")
+    var h = with_global(list.concat(list.concat(id, size), list.concat(flags, list.concat(model, [0x05, 0x00]))))
+    test.assert_eq(decode_code(var h), snmperr.SNMP_E_BAD_HEADER)
+    test.case("flags of two octets")
+    var i = with_global(list.concat(list.concat(id, size), list.concat([0x04, 0x02, 0x04, 0x00], model)))
+    test.assert_eq(decode_code(var i), snmperr.SNMP_E_BAD_FLAGS)
+
+@test
+fn test_the_scoped_pdu() [io]
+    var sc = SnmpScoped { context_engine: name_of("engine"), context_name: name_of("ctx") }
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 9)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var pool: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpv3.scoped_encode(var out, var sc, var p, var pool))
+    // 30 | 04 06 "engine" | 04 03 "ctx" | A0 0B ...: 8 + 5 + 13 = 26 = 0x1A.
+    test.assert_eq(out[0] as Int, 0x30)
+    test.assert_eq(out[1] as Int, 0x1A)
+    var sc2 = snmpv3.scoped_empty()
+    var q = snmppdu.pdu_new(0, 0)
+    test.assert_eq(snmpv3.scoped_decode(var out, 0, out.len(), var sc2, var q), snmperr.SNMP_OK)
+    test.assert_eq(sc2.context_engine.len(), 6)
+    test.assert_eq(sc2.context_name.len(), 3)
+    test.assert_eq(q.request_id, 9)
+    test.case("a scoped PDU that is not a sequence decrypts to nothing")
+    var bad = buf_of([0x04, 0x00])
+    test.assert_eq(snmpv3.scoped_decode(var bad, 0, 2, var sc2, var q), snmperr.SNMP_E_DECRYPT)
+    test.case("bytes after the PDU, a context engine ID that is not an octet string or is too long")
+    var trail = buf_of([0x30, 0x03, 0x04, 0x00, 0x04, 0x00, 0x00])
+    test.assert_eq(snmpv3.scoped_decode(var trail, 0, 7, var sc2, var q), snmperr.SNMP_E_BAD_LENGTH)
+    var notstr = buf_of([0x30, 0x03, 0x02, 0x01, 0x00])
+    test.assert_eq(snmpv3.scoped_decode(var notstr, 0, 5, var sc2, var q), snmperr.SNMP_E_BAD_TAG)
+    var long = buf_of([0x30, 0x23, 0x04, 0x21])
+    for _i in 0..33
+        let _ok = snmpber.put_byte(var long, 0)
+    test.assert_eq(snmpv3.scoped_decode(var long, 0, long.len(), var sc2, var q), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    var noname = buf_of([0x30, 0x02, 0x04, 0x00])
+    test.assert_eq(snmpv3.scoped_decode(var noname, 0, 4, var sc2, var q), snmperr.SNMP_E_TRUNCATED)
+    var empty = buf_of([])
+    test.assert_eq(snmpv3.scoped_decode(var empty, 0, 0, var sc2, var q), snmperr.SNMP_E_TRUNCATED)
+    test.case("a PDU that cannot be written")
+    var bad_pdu = snmppdu.pdu_new(0x30, 1)
+    out.clear()
+    test.assert(not snmpv3.scoped_encode(var out, var sc, var bad_pdu, var pool))
+
+@test
+fn test_names() [io]
+    var n: snmpber.SnmpName = Vec.new()
+    test.assert(snmpber.name_set(var n, "bert"))
+    test.assert_eq(n.len(), 4)
+    test.assert(not snmpber.name_set(var n, "012345678901234567890123456789012"))
+    test.assert_eq(n.len(), 0)
+    test.assert(snmpber.name_set(var n, "01234567890123456789012345678901"))
+    test.assert_eq(n.len(), 32)
+    var b: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpber.put_name(var b, var n))
+    test.assert_eq(b.len(), 34)
+    var m: snmpber.SnmpName = Vec.new()
+    test.assert(snmpber.get_name(var b, 2, 32, var m))
+    test.assert_eq(m.len(), 32)
+    test.assert(not snmpber.get_name(var b, 2, 33, var m))
+    test.assert(not snmpber.get_name(var b, 30, 32, var m))
+    test.assert(not snmpber.get_name(var b, -1, 1, var m))
+    test.assert(not snmpber.get_name(var b, 0, -1, var m))
+    var full: snmpber.SnmpBuf = Vec.new()
+    for _i in 0..snmpber.SNMP_MSG_MAX
+        let _ok = snmpber.put_byte(var full, 0)
+    test.assert(not snmpber.put_name(var full, var n))
+
+@test
+fn test_the_time_window_of_rfc_3414_section_3_2() [io]
+    // Step 7a: an authoritative engine accepts boots that equal its own and
+    // a time within 150 seconds, and refuses when its boots are at the
+    // maximum.
+    test.case("the authoritative engine")
+    test.assert(snmpv3.in_window_authoritative(5, 1000, 5, 1000))
+    test.assert(snmpv3.in_window_authoritative(5, 1000, 5, 1150))
+    test.assert(snmpv3.in_window_authoritative(5, 1000, 5, 850))
+    test.assert(not snmpv3.in_window_authoritative(5, 1000, 5, 1151))
+    test.assert(not snmpv3.in_window_authoritative(5, 1000, 5, 849))
+    test.assert(not snmpv3.in_window_authoritative(5, 1000, 4, 1000))
+    test.assert(not snmpv3.in_window_authoritative(5, 1000, 6, 1000))
+    test.assert(not snmpv3.in_window_authoritative(2147483647, 1000, 2147483647, 1000))
+
+    // Step 7b: a non-authoritative engine takes a newer clock, and refuses
+    // boots that went back or a time more than 150 seconds behind.
+    test.case("a remote engine: a newer boot count is taken")
+    var s = SnmpEngineSync { boots: 3, time: 500, latest: 500 }
+    test.assert(snmpv3.in_window_remote(var s, 500, 4, 10))
+    test.assert_eq(s.boots, 4)
+    test.assert_eq(s.latest, 10)
+    test.case("a later time under the same boots is taken")
+    test.assert(snmpv3.in_window_remote(var s, 12, 4, 20))
+    test.assert_eq(s.time, 20)
+    test.case("an earlier time within 150 seconds is accepted and not taken")
+    test.assert(snmpv3.in_window_remote(var s, 100, 4, 15))
+    test.assert_eq(s.latest, 20)
+    test.case("a time more than 150 seconds behind our estimate is refused")
+    test.assert(not snmpv3.in_window_remote(var s, 500, 4, 15))
+    test.case("boots that went back are refused")
+    test.assert(not snmpv3.in_window_remote(var s, 100, 3, 1000))
+    test.case("an engine at the maximum boots is refused")
+    var m = SnmpEngineSync { boots: 2147483647, time: 0, latest: 0 }
+    test.assert(not snmpv3.in_window_remote(var m, 0, 2147483647, 0))
+
+@test
+fn test_empty_constructors() [io]
+    let u = snmpv3.usm_empty()
+    test.assert_eq(u.engine_id.len(), 0)
+    let h = snmpv3.header_empty()
+    test.assert_eq(h.max_size, 0)
+    let s = snmpv3.scoped_empty()
+    test.assert_eq(s.context_name.len(), 0)
+    let l = snmpv3.layout_empty()
+    test.assert(not l.encrypted)
+    test.assert_eq(snmperr.error_text(snmperr.SNMP_E_WRONG_DIGEST), "the authentication digest does not match")
+    test.assert_eq(snmperr.error_text(999), "an unknown error code")
+    test.assert_eq(snmperr.error_status_name(snmperr.SNMP_NOT_WRITABLE), "notWritable")
+    test.assert_eq(snmperr.error_status_name(99), "unknown")

@@ -1,0 +1,503 @@
+// snmp_pdu_tests.nv — the PDUs of RFC 3416 and the messages of RFC 1157
+// and RFC 3584, byte by byte.
+//
+// THE VECTORS ARE DERIVED BY HAND from the layouts in RFC 1157, RFC 3416
+// and X.690, not recorded from this code.  Each is worked out in the
+// comment above it.  ASCII used throughout: "public" is 70 75 62 6C 69 63,
+// "Linux" is 4C 69 6E 75 78.
+
+use std.test
+use snmpber
+use snmperr
+use snmpoid
+use snmppdu
+
+fn diff(var p: snmpber.SnmpBuf, want: [Int]) -> Int
+    if p.len() != list.len(want)
+        return -2
+    for i in 0..p.len()
+        if (p[i] as Int) != want[i]
+            return i
+    -1
+
+fn buf_of(xs: [Int]) -> snmpber.SnmpBuf
+    var b: snmpber.SnmpBuf = Vec.new()
+    for x in xs
+        let _ok = snmpber.put_byte(var b, x)
+    b
+
+fn oid_of(text: Str) -> SnmpOid
+    var o = snmpoid.oid_empty()
+    let _ok = snmpoid.oid_parse(var o, text)
+    o
+
+// The bytes of `want` are the last bytes of the buffer.
+fn ends_with(var b: snmpber.SnmpBuf, want: [Int]) -> Bool
+    let n = list.len(want)
+    if b.len() < n
+        return false
+    for i in 0..n
+        if (b[b.len() - n + i] as Int) != want[i]
+            return false
+    true
+
+// A Response with one variable binding, sysUpTime.0 = 1.3.6.1.2.1.1.3.0.
+fn response_with(kind: Int, num: Int, var pool: snmpber.SnmpBuf, off: Int, len: Int) -> snmpber.SnmpBuf
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, 5)
+    var o = oid_of("1.3.6.1.2.1.1.3.0")
+    let _ok = snmppdu.add(var p, var o, kind, num, off, len)
+    var out: snmpber.SnmpBuf = Vec.new()
+    let _e = snmppdu.pdu_encode(var out, var p, var pool)
+    out
+
+// The sysDescr.0 request used by several tests: 1.3.6.1.2.1.1.1.0.
+fn get_request(version: Int) -> snmpber.SnmpBuf
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+    var o = oid_of("1.3.6.1.2.1.1.1.0")
+    let _a = snmppdu.add_null(var p, var o)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var pool: snmpber.SnmpBuf = Vec.new()
+    let _b = snmppdu.msg_encode(var out, version, "public", var p, var pool)
+    out
+
+@test
+fn test_a_v2c_get_request_byte_by_byte() [io]
+    // Varbind: OID 06 08 2B 06 01 02 01 01 01 00 (10) and NULL 05 00 (2),
+    // so 30 0C; the list is 30 0E; the PDU holds three integers of 3 and
+    // the list of 16, 25 in all, A0 19; the message holds the version (3),
+    // the community (8) and the PDU (27), 38, 30 26.
+    test.case("version 1, request-id 1")
+    var b = get_request(snmppdu.SNMP_V2C)
+    test.assert_eq(diff(var b, [0x30, 0x26, 0x02, 0x01, 0x01, 0x04, 0x06, 0x70, 0x75, 0x62, 0x6C, 0x69, 0x63,
+                                0xA0, 0x19, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
+                                0x30, 0x0E, 0x30, 0x0C, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00,
+                                0x05, 0x00]), -1)
+    test.case("the same for SNMPv1 differs only in the version")
+    var a = get_request(snmppdu.SNMP_V1)
+    test.assert_eq(a.len(), 40)
+    test.assert_eq(a[4] as Int, 0)
+
+@test
+fn test_a_response_with_a_string_byte_by_byte() [io]
+    // sysDescr.0 = "Linux": the value is 04 05 4C 69 6E 75 78 (7), the
+    // varbind 17 (30 11), the list 19 (30 13), the PDU 9 + 21 = 30 (A2 1E),
+    // the message 3 + 8 + 32 = 43 (30 2B).
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, 1)
+    var pool: snmpber.SnmpBuf = Vec.new()
+    let off = snmppdu.pool_add_str(var pool, "Linux")
+    var o = oid_of("1.3.6.1.2.1.1.1.0")
+    test.assert(snmppdu.add_span(var p, var o, snmppdu.SNMP_V_OCTETS, off, 5))
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "public", var p, var pool))
+    test.assert_eq(diff(var out, [0x30, 0x2B, 0x02, 0x01, 0x01, 0x04, 0x06, 0x70, 0x75, 0x62, 0x6C, 0x69, 0x63,
+                                  0xA2, 0x1E, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
+                                  0x30, 0x13, 0x30, 0x11, 0x06, 0x08, 0x2B, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00,
+                                  0x04, 0x05, 0x4C, 0x69, 0x6E, 0x75, 0x78]), -1)
+    test.case("and it is read back")
+    var info = snmppdu.info_new()
+    test.assert_eq(snmppdu.msg_decode(var out, var info), snmperr.SNMP_OK)
+    test.assert_eq(info.version, snmppdu.SNMP_V2C)
+    test.assert(snmppdu.community_is(var out, info, "public"))
+    test.assert(not snmppdu.community_is(var out, info, "publiC"))
+    test.assert(not snmppdu.community_is(var out, info, "pub"))
+    var q = snmppdu.pdu_new(0, 0)
+    test.assert_eq(snmppdu.pdu_decode(var out, info.pdu_off, info.pdu_end, var q), snmperr.SNMP_OK)
+    test.assert_eq(q.tag, snmppdu.SNMP_PDU_RESPONSE)
+    test.assert_eq(q.vbs.len(), 1)
+    test.assert_eq(q.vbs[0].kind, snmppdu.SNMP_V_OCTETS)
+    test.assert_eq(q.vbs[0].len, 5)
+    test.assert_eq(out[q.vbs[0].off] as Int, 0x4C)
+    test.assert_eq(snmpoid.oid_compare(var q.vbs[0].oid, var o), 0)
+
+@test
+fn test_each_value_kind_on_the_wire() [io]
+    var pool: snmpber.SnmpBuf = Vec.new()
+    // TimeTicks 360000 = 0x057E40: 43 03 05 7E 40.
+    test.case("TimeTicks")
+    var a = response_with(snmppdu.SNMP_V_TIMETICKS, 360000, var pool, 0, 0)
+    test.assert(ends_with(var a, [0x43, 0x03, 0x05, 0x7E, 0x40]))
+    // IpAddress 192.168.1.1 = 0xC0A80101: 40 04 C0 A8 01 01.
+    test.case("IpAddress")
+    var b = response_with(snmppdu.SNMP_V_IPADDRESS, 3232235777, var pool, 0, 0)
+    test.assert(ends_with(var b, [0x40, 0x04, 0xC0, 0xA8, 0x01, 0x01]))
+    test.case("Counter32 4294967295 needs the zero octet")
+    var c = response_with(snmppdu.SNMP_V_COUNTER32, 4294967295, var pool, 0, 0)
+    test.assert(ends_with(var c, [0x41, 0x05, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]))
+    test.case("Gauge32 128")
+    var d = response_with(snmppdu.SNMP_V_GAUGE32, 128, var pool, 0, 0)
+    test.assert(ends_with(var d, [0x42, 0x02, 0x00, 0x80]))
+    test.case("Counter64 with all 64 bits set")
+    var e = response_with(snmppdu.SNMP_V_COUNTER64, -1, var pool, 0, 0)
+    test.assert(ends_with(var e, [0x46, 0x09, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]))
+    test.case("Integer32 -1")
+    var f = response_with(snmppdu.SNMP_V_INTEGER, -1, var pool, 0, 0)
+    test.assert(ends_with(var f, [0x02, 0x01, 0xFF]))
+    test.case("the three exceptions of RFC 3416 section 4.2.1")
+    var g = response_with(snmppdu.SNMP_V_NO_SUCH_OBJECT, 0, var pool, 0, 0)
+    test.assert(ends_with(var g, [0x80, 0x00]))
+    var h = response_with(snmppdu.SNMP_V_NO_SUCH_INSTANCE, 0, var pool, 0, 0)
+    test.assert(ends_with(var h, [0x81, 0x00]))
+    var i = response_with(snmppdu.SNMP_V_END_OF_MIB_VIEW, 0, var pool, 0, 0)
+    test.assert(ends_with(var i, [0x82, 0x00]))
+    test.case("Opaque and an OBJECT IDENTIFIER value")
+    let off = snmppdu.pool_add_str(var pool, "xx")
+    var j = response_with(snmppdu.SNMP_V_OPAQUE, 0, var pool, off, 2)
+    test.assert(ends_with(var j, [0x44, 0x02, 0x78, 0x78]))
+    var oo = oid_of("1.3.6.1")
+    var pool2: snmpber.SnmpBuf = Vec.new()
+    let ooff = snmppdu.pool_add_oid(var pool2, var oo)
+    test.assert_eq(ooff, 0)
+    var k = response_with(snmppdu.SNMP_V_OID, 0, var pool2, ooff, snmpoid.oid_content_len(var oo))
+    test.assert(ends_with(var k, [0x06, 0x03, 0x2B, 0x06, 0x01]))
+    test.case("NULL")
+    var l = response_with(snmppdu.SNMP_V_NULL, 0, var pool, 0, 0)
+    test.assert(ends_with(var l, [0x05, 0x00]))
+
+@test
+fn test_values_that_cannot_be_written() [io]
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, 5)
+    var o = oid_of("1.3.6.1.2.1.1.3.0")
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.case("an Integer32 or a 32-bit unsigned out of range")
+    let _a = snmppdu.add(var p, var o, snmppdu.SNMP_V_INTEGER, 2147483648, 0, 0)
+    test.assert(not snmppdu.pdu_encode(var out, var p, var pool))
+    let q = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, 5)
+    for kind in [snmppdu.SNMP_V_COUNTER32, snmppdu.SNMP_V_GAUGE32, snmppdu.SNMP_V_TIMETICKS, snmppdu.SNMP_V_IPADDRESS]
+        var r = q
+        let _b = snmppdu.add(var r, var o, kind, 4294967296, 0, 0)
+        out.clear()
+        test.assert(not snmppdu.pdu_encode(var out, var r, var pool))
+        var s = q
+        let _c = snmppdu.add(var s, var o, kind, -1, 0, 0)
+        out.clear()
+        test.assert(not snmppdu.pdu_encode(var out, var s, var pool))
+    test.case("a span outside the pool, an empty OID value and an unknown kind")
+    var t = q
+    let _d = snmppdu.add(var t, var o, snmppdu.SNMP_V_OCTETS, 3, 5, 0)
+    out.clear()
+    test.assert(not snmppdu.pdu_encode(var out, var t, var pool))
+    var u = q
+    let _e = snmppdu.add(var u, var o, snmppdu.SNMP_V_OID, 0, 0, 0)
+    out.clear()
+    test.assert(not snmppdu.pdu_encode(var out, var u, var pool))
+    var v = q
+    let _f = snmppdu.add(var v, var o, 99, 0, 0, 0)
+    out.clear()
+    test.assert(not snmppdu.pdu_encode(var out, var v, var pool))
+    test.case("a name that cannot be packed")
+    var w = q
+    var bad = oid_of("3.1")
+    let _g = snmppdu.add_null(var w, var bad)
+    out.clear()
+    test.assert(not snmppdu.pdu_encode(var out, var w, var pool))
+    test.case("the add functions refuse the wrong kind, and a ninth binding")
+    var x = snmppdu.pdu_new(snmppdu.SNMP_PDU_SET, 1)
+    test.assert(not snmppdu.add_number(var x, var o, snmppdu.SNMP_V_OCTETS, 1))
+    test.assert(not snmppdu.add_span(var x, var o, snmppdu.SNMP_V_INTEGER, 0, 0))
+    test.assert(snmppdu.add_integer(var x, var o, 1))
+    test.assert(snmppdu.add_number(var x, var o, snmppdu.SNMP_V_COUNTER64, 1))
+    for _i in 0..6
+        test.assert(snmppdu.add_null(var x, var o))
+    test.assert_eq(x.vbs.len(), snmppdu.SNMP_VARBINDS_MAX)
+    test.assert(not snmppdu.add_null(var x, var o))
+    test.case("pdu tags that are not PDUs")
+    var y = snmppdu.pdu_new(0x30, 1)
+    out.clear()
+    test.assert(not snmppdu.pdu_encode(var out, var y, var pool))
+    var z = snmppdu.pdu_new(snmppdu.SNMP_PDU_TRAP_V1, 1)
+    test.assert(not snmppdu.pdu_encode(var out, var z, var pool))
+    test.case("pool helpers on a full pool or an identifier that cannot be packed")
+    var full: snmpber.SnmpBuf = Vec.new()
+    for _i in 0..snmpber.SNMP_MSG_MAX
+        let _ok = snmpber.put_byte(var full, 0)
+    test.assert_eq(snmppdu.pool_add_str(var full, "x"), -1)
+    test.assert_eq(snmppdu.pool_add_oid(var full, var o), -1)
+    test.assert_eq(snmppdu.pool_add_oid(var pool, var bad), -1)
+
+@test
+fn test_every_kind_is_read_back() [io]
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, 77)
+    var o = oid_of("1.3.6.1.2.1.1.3.0")
+    let off = snmppdu.pool_add_str(var pool, "abc")
+    let _a = snmppdu.add(var p, var o, snmppdu.SNMP_V_INTEGER, -300, 0, 0)
+    let _b = snmppdu.add(var p, var o, snmppdu.SNMP_V_IPADDRESS, 3232235777, 0, 0)
+    let _c = snmppdu.add(var p, var o, snmppdu.SNMP_V_COUNTER32, 4294967295, 0, 0)
+    let _d = snmppdu.add(var p, var o, snmppdu.SNMP_V_COUNTER64, -1, 0, 0)
+    let _e = snmppdu.add(var p, var o, snmppdu.SNMP_V_OPAQUE, 0, off, 3)
+    let _f = snmppdu.add(var p, var o, snmppdu.SNMP_V_NO_SUCH_INSTANCE, 0, 0, 0)
+    let _g = snmppdu.add(var p, var o, snmppdu.SNMP_V_GAUGE32, 7, 0, 0)
+    let _h = snmppdu.add(var p, var o, snmppdu.SNMP_V_TIMETICKS, 360000, 0, 0)
+    p = SnmpPdu { tag: p.tag, request_id: p.request_id, error_status: 0, error_index: 0, vbs: p.vbs }
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmppdu.pdu_encode(var out, var p, var pool))
+    var q = snmppdu.pdu_new(0, 0)
+    test.assert_eq(snmppdu.pdu_decode(var out, 0, out.len(), var q), snmperr.SNMP_OK)
+    test.assert_eq(q.request_id, 77)
+    test.assert_eq(q.vbs.len(), 8)
+    test.assert_eq(q.vbs[0].num, -300)
+    test.assert_eq(q.vbs[1].kind, snmppdu.SNMP_V_IPADDRESS)
+    test.assert_eq(q.vbs[1].num, 3232235777)
+    test.assert_eq(q.vbs[2].num, 4294967295)
+    test.assert_eq(q.vbs[3].kind, snmppdu.SNMP_V_COUNTER64)
+    test.assert_eq(q.vbs[3].num, -1)
+    test.assert_eq(q.vbs[4].kind, snmppdu.SNMP_V_OPAQUE)
+    test.assert_eq(q.vbs[4].len, 3)
+    test.assert_eq(q.vbs[5].kind, snmppdu.SNMP_V_NO_SUCH_INSTANCE)
+    test.assert_eq(q.vbs[6].kind, snmppdu.SNMP_V_GAUGE32)
+    test.assert_eq(q.vbs[7].kind, snmppdu.SNMP_V_TIMETICKS)
+    test.assert_eq(q.vbs[7].num, 360000)
+
+    test.case("an OBJECT IDENTIFIER value and a NULL")
+    var pool2: snmpber.SnmpBuf = Vec.new()
+    var val = oid_of("1.3.6.1.4.1.9")
+    let voff = snmppdu.pool_add_oid(var pool2, var val)
+    var r = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, 1)
+    let _i = snmppdu.add(var r, var o, snmppdu.SNMP_V_OID, 0, voff, snmpoid.oid_content_len(var val))
+    let _j = snmppdu.add_null(var r, var o)
+    var out2: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmppdu.pdu_encode(var out2, var r, var pool2))
+    var s = snmppdu.pdu_new(0, 0)
+    test.assert_eq(snmppdu.pdu_decode(var out2, 0, out2.len(), var s), snmperr.SNMP_OK)
+    test.assert_eq(s.vbs[0].kind, snmppdu.SNMP_V_OID)
+    var back = snmpoid.oid_empty()
+    test.assert_eq(snmpoid.oid_read(var out2, s.vbs[0].off, s.vbs[0].len, var back), snmperr.SNMP_OK)
+    test.assert_eq(snmpoid.oid_compare(var back, var val), 0)
+    test.assert_eq(s.vbs[1].kind, snmppdu.SNMP_V_NULL)
+
+    test.case("a GetBulkRequest carries its two numbers")
+    var bulk = SnmpPdu { tag: snmppdu.SNMP_PDU_GET_BULK, request_id: 9, error_status: 0, error_index: 10, vbs: Vec.new() }
+    let _k = snmppdu.add_null(var bulk, var o)
+    var out3: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmppdu.pdu_encode(var out3, var bulk, var pool))
+    var t = snmppdu.pdu_new(0, 0)
+    test.assert_eq(snmppdu.pdu_decode(var out3, 0, out3.len(), var t), snmperr.SNMP_OK)
+    test.assert_eq(t.tag, snmppdu.SNMP_PDU_GET_BULK)
+    test.assert_eq(t.error_status, 0)
+    test.assert_eq(t.error_index, 10)
+
+fn pdu_code(xs: [Int]) -> Int
+    var b = buf_of(xs)
+    var q = snmppdu.pdu_new(0, 0)
+    snmppdu.pdu_decode(var b, 0, b.len(), var q)
+
+@test
+fn test_pdus_that_are_refused() [io]
+    // A good PDU: A2 | 02 01 01 | 02 01 00 | 02 01 00 | 30 00.
+    let ok = [0xA2, 0x0B, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]
+    test.assert_eq(pdu_code(ok), snmperr.SNMP_OK)
+    test.case("a tag that is not a PDU, and the v1 trap tag")
+    test.assert_eq(pdu_code([0x30, 0x0B, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(pdu_code([0xA4, 0x0B, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.case("empty input and a length that runs past the end")
+    test.assert_eq(pdu_code([]), snmperr.SNMP_E_TRUNCATED)
+    test.assert_eq(pdu_code([0xA2, 0x0C, 0x02, 0x01, 0x01]), snmperr.SNMP_E_TRUNCATED)
+    test.case("each of the three integers: wrong tag, too long, out of 32 bits, missing")
+    test.assert_eq(pdu_code([0xA2, 0x0B, 0x04, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(pdu_code([0xA2, 0x0F, 0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), snmperr.SNMP_E_BAD_INTEGER)
+    test.assert_eq(pdu_code([0xA2, 0x0B, 0x02, 0x01, 0x01, 0x04, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(pdu_code([0xA2, 0x0B, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x04, 0x01, 0x00, 0x30, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(pdu_code([0xA2, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00]), snmperr.SNMP_E_TRUNCATED)
+    test.case("a binding list that is not a sequence, and bytes after it")
+    test.assert_eq(pdu_code([0xA2, 0x0B, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x04, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(pdu_code([0xA2, 0x0D, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00, 0x05, 0x00]), snmperr.SNMP_E_BAD_LENGTH)
+
+fn binding_code(xs: [Int]) -> Int
+    var inner = buf_of(xs)
+    var b: snmpber.SnmpBuf = Vec.new()
+    let m = snmpber.begin(var b)
+    let _a = snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 1)
+    let _c = snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 0)
+    let _d = snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 0)
+    let l = snmpber.begin(var b)
+    let _e = snmpber.put_raw(var b, var inner, 0, inner.len())
+    let _f = snmpber.end(var b, l, snmpber.SNMP_TAG_SEQUENCE)
+    let _g = snmpber.end(var b, m, snmppdu.SNMP_PDU_RESPONSE)
+    var q = snmppdu.pdu_new(0, 0)
+    snmppdu.pdu_decode(var b, 0, b.len(), var q)
+
+@test
+fn test_variable_bindings_that_are_refused() [io]
+    let name = [0x06, 0x03, 0x2B, 0x06, 0x01]
+    test.case("a good binding")
+    test.assert_eq(binding_code([0x30, 0x07, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x05, 0x00]), snmperr.SNMP_OK)
+    test.case("a binding that is not a sequence, a name that is not an OID, a bad name")
+    test.assert_eq(binding_code([0x04, 0x07, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x05, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(binding_code([0x30, 0x07, 0x04, 0x03, 0x2B, 0x06, 0x01, 0x05, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(binding_code([0x30, 0x07, 0x06, 0x03, 0x2B, 0x06, 0x86, 0x05, 0x00]), snmperr.SNMP_E_BAD_OID)
+    test.case("a binding with no value, and one with bytes after the value")
+    test.assert_eq(binding_code([0x30, 0x05, 0x06, 0x03, 0x2B, 0x06, 0x01]), snmperr.SNMP_E_TRUNCATED)
+    test.assert_eq(binding_code([0x30, 0x09, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x05, 0x00, 0x05, 0x00]), snmperr.SNMP_E_BAD_LENGTH)
+    test.case("a NULL with contents, a 3-octet IpAddress, an exception with contents, an unknown tag")
+    test.assert_eq(binding_code([0x30, 0x08, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x05, 0x01, 0x00]), snmperr.SNMP_E_BAD_VALUE)
+    test.assert_eq(binding_code([0x30, 0x0A, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x40, 0x03, 0x01, 0x02, 0x03]), snmperr.SNMP_E_BAD_VALUE)
+    test.assert_eq(binding_code([0x30, 0x08, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x82, 0x01, 0x00]), snmperr.SNMP_E_BAD_VALUE)
+    test.assert_eq(binding_code([0x30, 0x07, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x45, 0x00]), snmperr.SNMP_E_BAD_VALUE)
+    test.case("an Integer32 over 32 bits, a Counter32 of six octets, a Counter64 of ten")
+    test.assert_eq(binding_code([0x30, 0x0C, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x02, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]), snmperr.SNMP_E_BAD_INTEGER)
+    test.assert_eq(binding_code([0x30, 0x0D, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x41, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]), snmperr.SNMP_E_BAD_INTEGER)
+    test.assert_eq(binding_code([0x30, 0x11, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x46, 0x0A, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), snmperr.SNMP_E_BAD_INTEGER)
+    test.case("an OBJECT IDENTIFIER value that is empty or does not end")
+    test.assert_eq(binding_code([0x30, 0x07, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x06, 0x00]), snmperr.SNMP_E_BAD_OID)
+    test.assert_eq(binding_code([0x30, 0x08, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x06, 0x01, 0x81]), snmperr.SNMP_E_BAD_OID)
+    test.case("an identifier of more than 24 arcs")
+    var many = [0x30, 0x1F, 0x06, 0x1B, 0x2B]
+    for _i in 0..26
+        many = list.concat(many, [0x01])
+    many = list.concat(many, [0x05, 0x00])
+    test.assert_eq(binding_code(many), snmperr.SNMP_E_OID_TOO_LONG)
+    test.assert_eq(name[0], 0x06)
+
+@test
+fn test_nine_bindings_are_too_many() [io]
+    var inner: [Int] = []
+    for _i in 0..9
+        inner = list.concat(inner, [0x30, 0x07, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x05, 0x00])
+    test.assert_eq(binding_code(inner), snmperr.SNMP_E_TOO_MANY_VARBINDS)
+    var eight: [Int] = []
+    for _i in 0..8
+        eight = list.concat(eight, [0x30, 0x07, 0x06, 0x03, 0x2B, 0x06, 0x01, 0x05, 0x00])
+    test.assert_eq(binding_code(eight), snmperr.SNMP_OK)
+
+fn info_code(xs: [Int]) -> Int
+    var b = buf_of(xs)
+    var info = snmppdu.info_new()
+    snmppdu.msg_decode(var b, var info)
+
+@test
+fn test_messages_that_are_refused() [io]
+    let good = [0x30, 0x0F, 0x02, 0x01, 0x01, 0x04, 0x01, 0x61, 0xA2, 0x0A, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01]
+    test.assert_eq(info_code(good), snmperr.SNMP_E_BAD_LENGTH)
+    test.case("empty, not a sequence, and a length that does not fill the datagram")
+    test.assert_eq(info_code([]), snmperr.SNMP_E_TRUNCATED)
+    test.assert_eq(info_code([0x31, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(info_code([0x30, 0x00, 0x00]), snmperr.SNMP_E_BAD_LENGTH)
+    test.case("a version that is not an integer, and a version of 3 or 2")
+    test.assert_eq(info_code([0x30, 0x03, 0x04, 0x01, 0x01]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(info_code([0x30, 0x03, 0x02, 0x01, 0x03]), snmperr.SNMP_E_BAD_VERSION)
+    test.assert_eq(info_code([0x30, 0x03, 0x02, 0x01, 0x02]), snmperr.SNMP_E_BAD_VERSION)
+    test.case("a community that is not an octet string, and a missing PDU")
+    test.assert_eq(info_code([0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00]), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(info_code([0x30, 0x05, 0x02, 0x01, 0x01, 0x04, 0x00]), snmperr.SNMP_E_TRUNCATED)
+    test.case("a version that is a long integer, and a short community header")
+    test.assert_eq(info_code([0x30, 0x03, 0x02, 0x05, 0x01]), snmperr.SNMP_E_TRUNCATED)
+    test.assert_eq(info_code([0x30, 0x04, 0x02, 0x01, 0x01, 0x04]), snmperr.SNMP_E_TRUNCATED)
+
+@test
+fn test_a_v1_message_cannot_carry_a_v2_pdu() [io]
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    var o = oid_of("1.3.6.1.2.1.1.1.0")
+    for tag in [snmppdu.SNMP_PDU_GET_BULK, snmppdu.SNMP_PDU_INFORM, snmppdu.SNMP_PDU_TRAP_V2, snmppdu.SNMP_PDU_REPORT]
+        var p = snmppdu.pdu_new(tag, 1)
+        let _a = snmppdu.add_null(var p, var o)
+        out.clear()
+        test.assert(not snmppdu.msg_encode(var out, snmppdu.SNMP_V1, "public", var p, var pool))
+        out.clear()
+        test.assert(snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "public", var p, var pool))
+    test.case("a version that is neither, and a community of 33 octets")
+    var p2 = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+    out.clear()
+    test.assert(not snmppdu.msg_encode(var out, 3, "public", var p2, var pool))
+    test.assert(not snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "0123456789012345678901234567890123", var p2, var pool))
+
+@test
+fn test_the_v1_trap_byte_by_byte() [io]
+    // enterprise 1.3.6.1.4.1.9: 06 06 2B 06 01 04 01 09 (8); agent address
+    // 10.0.0.1: 40 04 0A 00 00 01 (6); generic 6, specific 1: 02 01 06 and
+    // 02 01 01; timestamp 100: 43 01 64; no bindings: 30 00.  The PDU holds
+    // 8 + 6 + 3 + 3 + 3 + 2 = 25, A4 19; the message 3 + 8 + 27 = 38, 30 26.
+    var e = oid_of("1.3.6.1.4.1.9")
+    var t = snmppdu.trap1_new(var e, 167772161, 6, 1, 100)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var pool: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmppdu.trap1_encode(var out, "public", var t, var pool))
+    test.assert_eq(diff(var out, [0x30, 0x26, 0x02, 0x01, 0x00, 0x04, 0x06, 0x70, 0x75, 0x62, 0x6C, 0x69, 0x63,
+                                  0xA4, 0x19, 0x06, 0x06, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x09,
+                                  0x40, 0x04, 0x0A, 0x00, 0x00, 0x01, 0x02, 0x01, 0x06, 0x02, 0x01, 0x01,
+                                  0x43, 0x01, 0x64, 0x30, 0x00]), -1)
+    test.case("and it is read back")
+    var info = snmppdu.info_new()
+    test.assert_eq(snmppdu.msg_decode(var out, var info), snmperr.SNMP_OK)
+    test.assert_eq(info.pdu_tag, snmppdu.SNMP_PDU_TRAP_V1)
+    var u = snmppdu.trap1_empty()
+    test.assert_eq(snmppdu.trap1_decode(var out, info, var u), snmperr.SNMP_OK)
+    test.assert_eq(u.agent_addr, 167772161)
+    test.assert_eq(u.generic, 6)
+    test.assert_eq(u.specific, 1)
+    test.assert_eq(u.timestamp, 100)
+    test.assert_eq(snmpoid.oid_compare(var u.enterprise, var e), 0)
+    test.assert_eq(u.binds.vbs.len(), 0)
+
+    test.case("with bindings")
+    var t2 = snmppdu.trap1_new(var e, 167772161, 2, 0, 5)
+    var name = oid_of("1.3.6.1.2.1.2.2.1.1.3")
+    test.assert(snmppdu.add_integer(var t2.binds, var name, 3))
+    var out2: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmppdu.trap1_encode(var out2, "public", var t2, var pool))
+    var info2 = snmppdu.info_new()
+    test.assert_eq(snmppdu.msg_decode(var out2, var info2), snmperr.SNMP_OK)
+    var u2 = snmppdu.trap1_empty()
+    test.assert_eq(snmppdu.trap1_decode(var out2, info2, var u2), snmperr.SNMP_OK)
+    test.assert_eq(u2.binds.vbs.len(), 1)
+    test.assert_eq(u2.binds.vbs[0].num, 3)
+
+    test.case("a trap that cannot be written")
+    var bad = snmppdu.trap1_new(var e, 0, -1, 0, 0)
+    test.assert(not snmppdu.trap1_encode(var out, "public", var bad, var pool))
+    var bad2 = snmppdu.trap1_new(var e, 0, 0, -1, 0)
+    test.assert(not snmppdu.trap1_encode(var out, "public", var bad2, var pool))
+    var bad3 = snmppdu.trap1_new(var e, 0, 0, 0, 4294967296)
+    test.assert(not snmppdu.trap1_encode(var out, "public", var bad3, var pool))
+    var bad4 = snmppdu.trap1_new(var e, 4294967296, 0, 0, 0)
+    test.assert(not snmppdu.trap1_encode(var out, "public", var bad4, var pool))
+
+fn trap_code(body: [Int]) -> Int
+    // A trap message around the given PDU contents.
+    var inner = buf_of(body)
+    var b: snmpber.SnmpBuf = Vec.new()
+    let m = snmpber.begin(var b)
+    let _a = snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 0)
+    let _c = snmpber.put_str(var b, snmpber.SNMP_TAG_OCTET_STRING, "p")
+    let p = snmpber.begin(var b)
+    let _d = snmpber.put_raw(var b, var inner, 0, inner.len())
+    let _e = snmpber.end(var b, p, snmppdu.SNMP_PDU_TRAP_V1)
+    let _f = snmpber.end(var b, m, snmpber.SNMP_TAG_SEQUENCE)
+    var info = snmppdu.info_new()
+    let c = snmppdu.msg_decode(var b, var info)
+    if c != snmperr.SNMP_OK
+        return c
+    var t = snmppdu.trap1_empty()
+    snmppdu.trap1_decode(var b, info, var t)
+
+@test
+fn test_traps_that_are_refused() [io]
+    let ent = [0x06, 0x03, 0x2B, 0x06, 0x01]
+    let addr = [0x40, 0x04, 0x01, 0x02, 0x03, 0x04]
+    let tail = [0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x43, 0x01, 0x00, 0x30, 0x00]
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), tail)), snmperr.SNMP_OK)
+    test.case("the enterprise is not an OID, is not readable, or is missing")
+    test.assert_eq(trap_code(list.concat(list.concat([0x04, 0x03, 0x2B, 0x06, 0x01], addr), tail)), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(trap_code(list.concat(list.concat([0x06, 0x03, 0x2B, 0x06, 0x86], addr), tail)), snmperr.SNMP_E_BAD_OID)
+    test.assert_eq(trap_code([]), snmperr.SNMP_E_TRUNCATED)
+    test.case("the agent address is not an IpAddress of four octets, or is missing")
+    test.assert_eq(trap_code(list.concat(list.concat(ent, [0x40, 0x03, 0x01, 0x02, 0x03]), tail)), snmperr.SNMP_E_BAD_VALUE)
+    test.assert_eq(trap_code(list.concat(list.concat(ent, [0x04, 0x04, 0x01, 0x02, 0x03, 0x04]), tail)), snmperr.SNMP_E_BAD_VALUE)
+    test.assert_eq(trap_code(ent), snmperr.SNMP_E_TRUNCATED)
+    test.case("the generic and specific numbers and the time stamp")
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), [0x04, 0x01, 0x00])), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), [0x02, 0x01, 0x00, 0x04, 0x01, 0x00])), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), [0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00])), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), [0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x43, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00])), snmperr.SNMP_E_BAD_INTEGER)
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), [0x02, 0x01, 0x00])), snmperr.SNMP_E_TRUNCATED)
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), [0x02, 0x01, 0x00, 0x02, 0x01, 0x00])), snmperr.SNMP_E_TRUNCATED)
+    test.case("bad bindings and bytes after them")
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), [0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x43, 0x01, 0x00, 0x04, 0x00])), snmperr.SNMP_E_BAD_TAG)
+    test.assert_eq(trap_code(list.concat(list.concat(ent, addr), list.concat(tail, [0x05, 0x00]))), snmperr.SNMP_E_BAD_LENGTH)
+    test.case("trap1_decode refuses a message that is not a v1 trap")
+    var b = get_request(snmppdu.SNMP_V1)
+    var info = snmppdu.info_new()
+    test.assert_eq(snmppdu.msg_decode(var b, var info), snmperr.SNMP_OK)
+    var t = snmppdu.trap1_empty()
+    test.assert_eq(snmppdu.trap1_decode(var b, info, var t), snmperr.SNMP_E_BAD_TAG)

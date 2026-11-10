@@ -1,0 +1,435 @@
+// snmp_ber_tests.nv — the BER that SNMP uses and the object identifiers,
+// byte by byte.
+//
+// THE VECTORS ARE DERIVED BY HAND from X.690 and RFC 1155, not recorded
+// from this code.  Each is worked out in the comment above it.  The
+// identifier example of X.690 section 8.19.5, 2.100.3, is the one that
+// catches a first arc taken as packed / 40.
+
+use std.test
+use snmpber
+use snmperr
+use snmpoid
+
+// The index of the first byte of the buffer that differs from the
+// expected list, -2 when the lengths differ, and -1 when they agree.
+fn diff(var p: snmpber.SnmpBuf, want: [Int]) -> Int
+    if p.len() != list.len(want)
+        return -2
+    for i in 0..p.len()
+        if (p[i] as Int) != want[i]
+            return i
+    -1
+
+fn oid_of(text: Str) -> SnmpOid
+    var o = snmpoid.oid_empty()
+    let ok = snmpoid.oid_parse(var o, text)
+    if not ok
+        return snmpoid.oid_empty()
+    o
+
+@test
+fn test_signed_integers_in_the_shortest_form() [io]
+    var b: snmpber.SnmpBuf = Vec.new()
+    // 0 is 02 01 00; 127 is 7F; 128 needs the zero octet 00 80, because
+    // 80 alone is -128.
+    test.case("127 and 128")
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 0))
+    test.assert_eq(diff(var b, [0x02, 0x01, 0x00]), -1)
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 127))
+    test.assert_eq(diff(var b, [0x02, 0x01, 0x7F]), -1)
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 128))
+    test.assert_eq(diff(var b, [0x02, 0x02, 0x00, 0x80]), -1)
+    // -128 is 80; -129 is FF 7F; 256 is 01 00.
+    test.case("-128, -129 and 256")
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, -128))
+    test.assert_eq(diff(var b, [0x02, 0x01, 0x80]), -1)
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, -129))
+    test.assert_eq(diff(var b, [0x02, 0x02, 0xFF, 0x7F]), -1)
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 256))
+    test.assert_eq(diff(var b, [0x02, 0x02, 0x01, 0x00]), -1)
+    // 2147483647 is 7F FF FF FF; 2147483648 is 00 80 00 00 00.
+    test.case("the 32-bit limits")
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 2147483647))
+    test.assert_eq(diff(var b, [0x02, 0x04, 0x7F, 0xFF, 0xFF, 0xFF]), -1)
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 2147483648))
+    test.assert_eq(diff(var b, [0x02, 0x05, 0x00, 0x80, 0x00, 0x00, 0x00]), -1)
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, -2147483648))
+    test.assert_eq(diff(var b, [0x02, 0x04, 0x80, 0x00, 0x00, 0x00]), -1)
+    test.case("the 64-bit limits")
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, -9223372036854775807 - 1))
+    test.assert_eq(diff(var b, [0x02, 0x08, 0x80, 0, 0, 0, 0, 0, 0, 0]), -1)
+    b.clear()
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 9223372036854775807))
+    test.assert_eq(diff(var b, [0x02, 0x08, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), -1)
+    test.case("the lengths")
+    test.assert_eq(snmpber.integer_len(0), 1)
+    test.assert_eq(snmpber.integer_len(-1), 1)
+    test.assert_eq(snmpber.integer_len(32768), 3)
+    test.assert_eq(snmpber.integer_len(-32768), 2)
+
+@test
+fn test_unsigned_values_get_a_zero_octet_when_the_top_bit_is_set() [io]
+    var b: snmpber.SnmpBuf = Vec.new()
+    // Counter32 255 is 00 FF: FF alone would be -1.
+    test.case("0, 127, 128 and 255")
+    test.assert(snmpber.put_unsigned(var b, snmpber.SNMP_TAG_COUNTER32, 0))
+    test.assert_eq(diff(var b, [0x41, 0x01, 0x00]), -1)
+    b.clear()
+    test.assert(snmpber.put_unsigned(var b, snmpber.SNMP_TAG_GAUGE32, 127))
+    test.assert_eq(diff(var b, [0x42, 0x01, 0x7F]), -1)
+    b.clear()
+    test.assert(snmpber.put_unsigned(var b, snmpber.SNMP_TAG_TIMETICKS, 128))
+    test.assert_eq(diff(var b, [0x43, 0x02, 0x00, 0x80]), -1)
+    b.clear()
+    test.assert(snmpber.put_unsigned(var b, snmpber.SNMP_TAG_COUNTER32, 255))
+    test.assert_eq(diff(var b, [0x41, 0x02, 0x00, 0xFF]), -1)
+    test.case("the largest Counter32")
+    b.clear()
+    test.assert(snmpber.put_unsigned(var b, snmpber.SNMP_TAG_COUNTER32, 4294967295))
+    test.assert_eq(diff(var b, [0x41, 0x05, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]), -1)
+    // Counter64 2^64 - 1 is nine octets, the zero and eight FF; 2^63 is
+    // the zero and 80 00 00 00 00 00 00 00.
+    test.case("the largest Counter64 and 2^63")
+    b.clear()
+    test.assert(snmpber.put_unsigned(var b, snmpber.SNMP_TAG_COUNTER64, -1))
+    test.assert_eq(diff(var b, [0x46, 0x09, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), -1)
+    b.clear()
+    test.assert(snmpber.put_unsigned(var b, snmpber.SNMP_TAG_COUNTER64, -9223372036854775807 - 1))
+    test.assert_eq(diff(var b, [0x46, 0x09, 0x00, 0x80, 0, 0, 0, 0, 0, 0, 0]), -1)
+    test.case("the lengths")
+    test.assert_eq(snmpber.unsigned_len(0), 1)
+    test.assert_eq(snmpber.unsigned_len(256), 2)
+    test.assert_eq(snmpber.unsigned_len(9223372036854775807), 8)
+
+@test
+fn test_lengths_and_constructed_values() [io]
+    var b: snmpber.SnmpBuf = Vec.new()
+    // X.690 section 8.1.3: 127 is the short form, 128 is 81 80, 300 is
+    // 82 01 2C.
+    test.case("the short and the long forms")
+    test.assert(snmpber.put_head(var b, snmpber.SNMP_TAG_SEQUENCE, 127))
+    test.assert_eq(diff(var b, [0x30, 0x7F]), -1)
+    b.clear()
+    test.assert(snmpber.put_head(var b, snmpber.SNMP_TAG_SEQUENCE, 128))
+    test.assert_eq(diff(var b, [0x30, 0x81, 0x80]), -1)
+    b.clear()
+    test.assert(snmpber.put_head(var b, snmpber.SNMP_TAG_SEQUENCE, 300))
+    test.assert_eq(diff(var b, [0x30, 0x82, 0x01, 0x2C]), -1)
+    test.assert(not snmpber.put_head(var b, snmpber.SNMP_TAG_SEQUENCE, -1))
+
+    test.case("a sequence closed after its contents")
+    b.clear()
+    let mark = snmpber.begin(var b)
+    test.assert(snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 1))
+    test.assert(snmpber.put_str(var b, snmpber.SNMP_TAG_OCTET_STRING, "ab"))
+    test.assert(snmpber.end(var b, mark, snmpber.SNMP_TAG_SEQUENCE))
+    test.assert_eq(diff(var b, [0x30, 0x07, 0x02, 0x01, 0x01, 0x04, 0x02, 0x61, 0x62]), -1)
+
+    // 130 bytes of contents need the long form, so the contents move up by
+    // two octets.
+    test.case("contents that need a long length move up")
+    b.clear()
+    let m2 = snmpber.begin(var b)
+    for _i in 0..130
+        test.assert(snmpber.put_byte(var b, 0x55))
+    test.assert(snmpber.end(var b, m2, snmpber.SNMP_TAG_SEQUENCE))
+    test.assert_eq(b.len(), 133)
+    test.assert_eq(b[0] as Int, 0x30)
+    test.assert_eq(b[1] as Int, 0x81)
+    test.assert_eq(b[2] as Int, 130)
+    test.assert_eq(b[132] as Int, 0x55)
+
+    test.case("a constructed value inside another")
+    b.clear()
+    let outer = snmpber.begin(var b)
+    let inner = snmpber.begin(var b)
+    test.assert(snmpber.put_byte(var b, 0x05))
+    test.assert(snmpber.put_byte(var b, 0x00))
+    test.assert(snmpber.end(var b, inner, snmpber.SNMP_TAG_SEQUENCE))
+    test.assert(snmpber.end(var b, outer, snmpber.SNMP_TAG_SEQUENCE))
+    test.assert_eq(diff(var b, [0x30, 0x04, 0x30, 0x02, 0x05, 0x00]), -1)
+
+    test.case("end refuses a mark that is not in the buffer")
+    test.assert(not snmpber.end(var b, 99, snmpber.SNMP_TAG_SEQUENCE))
+    test.assert(not snmpber.end(var b, -1, snmpber.SNMP_TAG_SEQUENCE))
+
+@test
+fn test_a_full_buffer_refuses() [io]
+    var b: snmpber.SnmpBuf = Vec.new()
+    for _i in 0..snmpber.SNMP_MSG_MAX
+        test.assert(snmpber.put_byte(var b, 1))
+    test.assert(not snmpber.put_byte(var b, 1))
+    test.assert(not snmpber.put_head(var b, snmpber.SNMP_TAG_SEQUENCE, 5))
+    test.assert(not snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 5))
+    test.assert(not snmpber.end(var b, 0, snmpber.SNMP_TAG_SEQUENCE))
+    var src: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpber.put_str(var src, snmpber.SNMP_TAG_OCTET_STRING, "xyz"))
+    test.assert(not snmpber.put_raw(var b, var src, 0, 3))
+    test.case("put_raw and put_span refuse a range outside the source")
+    var c: snmpber.SnmpBuf = Vec.new()
+    test.assert(not snmpber.put_raw(var c, var src, 4, 3))
+    test.assert(not snmpber.put_raw(var c, var src, -1, 1))
+    test.assert(not snmpber.put_raw(var c, var src, 0, -1))
+    test.assert(snmpber.put_span(var c, snmpber.SNMP_TAG_OCTET_STRING, var src, 2, 3))
+    test.assert_eq(diff(var c, [0x04, 0x03, 0x78, 0x79, 0x7A]), -1)
+
+@test
+fn test_reading_headers() [io]
+    var b: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpber.put_str(var b, snmpber.SNMP_TAG_OCTET_STRING, "hi"))
+    test.case("a header and where the contents end")
+    let h = snmpber.read_head(var b, 0, b.len())
+    test.assert(h.ok)
+    test.assert_eq(h.tag, 4)
+    test.assert_eq(h.len, 2)
+    test.assert_eq(h.hdr, 2)
+
+    test.case("contents that run past the limit")
+    let t = snmpber.read_head(var b, 0, 3)
+    test.assert(not t.ok)
+    test.assert_eq(t.code, snmperr.SNMP_E_TRUNCATED)
+    test.case("an offset at or past the limit, and a negative one")
+    test.assert_eq(snmpber.read_head(var b, 4, 4).code, snmperr.SNMP_E_TRUNCATED)
+    test.assert_eq(snmpber.read_head(var b, -1, 4).code, snmperr.SNMP_E_TRUNCATED)
+    test.assert_eq(snmpber.read_head(var b, 0, 5000).code, snmperr.SNMP_E_TRUNCATED)
+    test.case("a long form")
+    var l: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpber.put_head(var l, snmpber.SNMP_TAG_SEQUENCE, 300))
+    for _i in 0..300
+        test.assert(snmpber.put_byte(var l, 0))
+    let g = snmpber.read_head(var l, 0, l.len())
+    test.assert(g.ok)
+    test.assert_eq(g.len, 300)
+    test.assert_eq(g.hdr, 4)
+    test.case("a header cut short in the middle of a long length")
+    var c: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpber.put_byte(var c, 0x30))
+    test.assert(snmpber.put_byte(var c, 0x82))
+    test.assert(snmpber.put_byte(var c, 0x01))
+    test.assert_eq(snmpber.read_head(var c, 0, 3).code, snmperr.SNMP_E_TRUNCATED)
+    test.case("an indefinite length, a reserved length and a high tag")
+    var d: snmpber.SnmpBuf = Vec.new()
+    for x in [0x30, 0x80, 0x00, 0x00]
+        test.assert(snmpber.put_byte(var d, x))
+    test.assert_eq(snmpber.read_head(var d, 0, 4).code, snmperr.SNMP_E_BAD_LENGTH)
+    var e: snmpber.SnmpBuf = Vec.new()
+    for x in [0x30, 0xFF, 0x00]
+        test.assert(snmpber.put_byte(var e, x))
+    test.assert_eq(snmpber.read_head(var e, 0, 3).code, snmperr.SNMP_E_BAD_LENGTH)
+    var f: snmpber.SnmpBuf = Vec.new()
+    for x in [0x1F, 0x05, 0x00]
+        test.assert(snmpber.put_byte(var f, x))
+    test.assert_eq(snmpber.read_head(var f, 0, 3).code, snmperr.SNMP_E_BAD_LENGTH)
+    test.case("a length over the buffer size")
+    var g2: snmpber.SnmpBuf = Vec.new()
+    for x in [0x30, 0x84, 0x00, 0x10, 0x00, 0x00]
+        test.assert(snmpber.put_byte(var g2, x))
+    test.assert_eq(snmpber.read_head(var g2, 0, 6).code, snmperr.SNMP_E_BAD_LENGTH)
+
+fn bytes_in(var b: snmpber.SnmpBuf, xs: [Int])
+    for x in xs
+        let _ok = snmpber.put_byte(var b, x)
+
+@test
+fn test_reading_integers() [io]
+    var b: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var b, [0xFF, 0x7F, 0x00, 0x80, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    test.case("signed, with the sign extended")
+    test.assert_eq(snmpber.read_integer(var b, 0, 2).value, -129)
+    test.assert_eq(snmpber.read_integer(var b, 2, 2).value, 128)
+    test.assert_eq(snmpber.read_integer(var b, 1, 1).value, 127)
+    test.assert_eq(snmpber.read_integer(var b, 0, 1).value, -1)
+    test.assert_eq(snmpber.read_integer(var b, 5, 8).value, -9223372036854775807 - 1)
+    test.case("signed, refused when empty, over eight octets or outside the buffer")
+    test.assert(not snmpber.read_integer(var b, 0, 0).ok)
+    test.assert(not snmpber.read_integer(var b, 0, 9).ok)
+    test.assert(not snmpber.read_integer(var b, 14, 2).ok)
+    test.assert(not snmpber.read_integer(var b, -1, 1).ok)
+
+    test.case("unsigned 32 bits")
+    var u: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var u, [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    test.assert_eq(snmpber.read_unsigned(var u, 0, 5, 32).value, 4294967295)
+    test.assert(snmpber.read_unsigned(var u, 0, 5, 32).ok)
+    test.case("a leading octet with the top bit set and no zero before it reads as positive")
+    test.assert_eq(snmpber.read_unsigned(var u, 5, 4, 32).value, 2147483649)
+    test.case("32 bits refuses six octets and five that begin with a non-zero octet")
+    test.assert(not snmpber.read_unsigned(var u, 0, 6, 32).ok)
+    test.assert(not snmpber.read_unsigned(var u, 1, 5, 32).ok)
+    test.case("64 bits, nine octets with a zero first, and eight with the top bit set")
+    test.assert(snmpber.read_unsigned(var u, 15, 9, 64).ok)
+    test.assert_eq(snmpber.read_unsigned(var u, 16, 8, 64).value, -1)
+    test.assert(not snmpber.read_unsigned(var u, 0, 10, 64).ok)
+    test.assert(not snmpber.read_unsigned(var u, 1, 9, 64).ok)
+    test.assert(not snmpber.read_unsigned(var u, 0, 0, 64).ok)
+    test.assert(not snmpber.read_unsigned(var u, 20, 9, 64).ok)
+    test.assert(not snmpber.read_unsigned(var u, -1, 1, 64).ok)
+
+@test
+fn test_object_identifier_text() [io]
+    test.case("a dotted text, with and without the leading dot")
+    var o = snmpoid.oid_empty()
+    test.assert(snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0"))
+    test.assert_eq(snmpoid.oid_len(var o), 9)
+    test.assert_eq(snmpoid.oid_arc(var o, 8), 0)
+    test.assert_eq(snmpoid.oid_arc(var o, 2), 6)
+    test.assert(snmpoid.oid_parse(var o, ".1.3.6"))
+    test.assert_eq(snmpoid.oid_len(var o), 3)
+    test.case("the empty text, and arcs at the limits")
+    test.assert(snmpoid.oid_parse(var o, ""))
+    test.assert_eq(snmpoid.oid_len(var o), 0)
+    test.assert(snmpoid.oid_parse(var o, "1.4294967295"))
+    test.assert_eq(snmpoid.oid_arc(var o, 1), 4294967295)
+    test.case("arc out of range")
+    test.assert_eq(snmpoid.oid_arc(var o, 2), -1)
+    test.assert_eq(snmpoid.oid_arc(var o, -1), -1)
+    test.case("texts that are not identifiers leave it empty")
+    for bad in ["1.3.", ".", "..1", "1..3", "1.x", "1.4294967296", "-1", "1.00000000000", "1 3", "1.3.6.1.2.1.1.1.0.1.2.3.4.5.6.7.8.9.1.2.3.4.5.6.7"]
+        test.assert(not snmpoid.oid_parse(var o, bad))
+        test.assert_eq(snmpoid.oid_len(var o), 0)
+    test.case("the most arcs that fit")
+    test.assert(snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0.1.2.3.4.5.6.7.8.9.1.2.3.4.5.6"))
+    test.assert_eq(snmpoid.oid_len(var o), snmpoid.SNMP_OID_MAX)
+    test.assert(not snmpoid.oid_push(var o, 1))
+    test.assert(not snmpoid.oid_push(var o, -1))
+    test.assert(not snmpoid.oid_push(var o, 4294967296))
+
+@test
+fn test_object_identifier_order() [io]
+    test.case("a prefix sorts before what extends it")
+    var a = oid_of("1.3.6.1")
+    var b = oid_of("1.3.6.1.2")
+    var c = oid_of("1.3.6.2")
+    test.assert_eq(snmpoid.oid_compare(var a, var b), -1)
+    test.assert_eq(snmpoid.oid_compare(var b, var a), 1)
+    var a2 = oid_of("1.3.6.1")
+    test.assert_eq(snmpoid.oid_compare(var a, var a2), 0)
+    test.assert_eq(snmpoid.oid_compare(var b, var c), -1)
+    test.assert_eq(snmpoid.oid_compare(var c, var b), 1)
+    test.case("a numeric order, not a text order: 9 before 10")
+    var nine = oid_of("1.3.6.1.2.1.9")
+    var ten = oid_of("1.3.6.1.2.1.10")
+    test.assert_eq(snmpoid.oid_compare(var nine, var ten), -1)
+    test.case("prefixes")
+    test.assert(snmpoid.oid_is_prefix(var a, var b))
+    test.assert(snmpoid.oid_is_prefix(var a, var a2))
+    test.assert(not snmpoid.oid_is_prefix(var b, var a))
+    test.assert(not snmpoid.oid_is_prefix(var c, var b))
+    test.case("a copy")
+    var d = snmpoid.oid_empty()
+    snmpoid.oid_copy(var d, var b)
+    test.assert_eq(snmpoid.oid_compare(var d, var b), 0)
+
+@test
+fn test_object_identifier_on_the_wire() [io]
+    var b: snmpber.SnmpBuf = Vec.new()
+    // 1.3.6.1.2.1.1.1.0: the first two arcs pack to 40 * 1 + 3 = 43 = 2B,
+    // the rest are one octet each, so the contents are 2B 06 01 02 01 01 01
+    // 00 and the length is 8 (the sysDescr.0 of RFC 1213).
+    test.case("sysDescr.0")
+    var o = oid_of("1.3.6.1.2.1.1.1.0")
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var o))
+    test.assert_eq(diff(var b, [0x06, 0x08, 0x2B, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00]), -1)
+    test.assert_eq(snmpoid.oid_content_len(var o), 8)
+
+    // 1.3.6.1.4.1.311.21.20: 311 = 2 * 128 + 55, so the arc is 82 37.
+    test.case("an arc over 127 takes two octets")
+    b.clear()
+    var m = oid_of("1.3.6.1.4.1.311.21.20")
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var m))
+    test.assert_eq(diff(var b, [0x06, 0x09, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x15, 0x14]), -1)
+
+    // X.690 section 8.19.5: 2.100.3 packs 40 * 2 + 100 = 180 = 0x81 0x34.
+    test.case("2.100.3, the example of X.690 section 8.19.5")
+    b.clear()
+    var x = oid_of("2.100.3")
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var x))
+    test.assert_eq(diff(var b, [0x06, 0x03, 0x81, 0x34, 0x03]), -1)
+
+    // 1.3 alone is the single octet 2B; 4294967295 is five octets
+    // 8F FF FF FF 7F.
+    test.case("two arcs, and the largest arc")
+    b.clear()
+    var two = oid_of("1.3")
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var two))
+    test.assert_eq(diff(var b, [0x06, 0x01, 0x2B]), -1)
+    b.clear()
+    var big = oid_of("1.3.4294967295")
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var big))
+    test.assert_eq(diff(var b, [0x06, 0x06, 0x2B, 0x8F, 0xFF, 0xFF, 0xFF, 0x7F]), -1)
+
+    test.case("identifiers that cannot be packed")
+    b.clear()
+    var one = oid_of("1")
+    test.assert(not snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var one))
+    var bad_first = oid_of("3.1")
+    test.assert(not snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var bad_first))
+    var bad_second = oid_of("1.40")
+    test.assert(not snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var bad_second))
+    test.assert_eq(snmpoid.oid_content_len(var bad_second), -1)
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var x))
+
+@test
+fn test_reading_object_identifiers() [io]
+    var b: snmpber.SnmpBuf = Vec.new()
+    var r = snmpoid.oid_empty()
+    test.case("what the writer wrote")
+    var o = oid_of("1.3.6.1.4.1.311.21.20")
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var o))
+    test.assert_eq(snmpoid.oid_read(var b, 2, 9, var r), snmperr.SNMP_OK)
+    test.assert_eq(snmpoid.oid_compare(var r, var o), 0)
+    test.case("2.100.3, whose first octet pair packs to 180")
+    var x = oid_of("2.100.3")
+    b.clear()
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var x))
+    test.assert_eq(snmpoid.oid_read(var b, 2, 3, var r), snmperr.SNMP_OK)
+    test.assert_eq(snmpoid.oid_arc(var r, 0), 2)
+    test.assert_eq(snmpoid.oid_arc(var r, 1), 100)
+    test.case("the largest arc")
+    var big = oid_of("1.3.4294967295")
+    b.clear()
+    test.assert(snmpoid.oid_put(var b, snmpber.SNMP_TAG_OID, var big))
+    test.assert_eq(snmpoid.oid_read(var b, 2, 6, var r), snmperr.SNMP_OK)
+    test.assert_eq(snmpoid.oid_arc(var r, 2), 4294967295)
+
+    test.case("empty contents and a range outside the buffer")
+    test.assert_eq(snmpoid.oid_read(var b, 0, 0, var r), snmperr.SNMP_E_BAD_OID)
+    test.assert_eq(snmpoid.oid_read(var b, 0, 99, var r), snmperr.SNMP_E_BAD_OID)
+    test.assert_eq(snmpoid.oid_read(var b, -1, 1, var r), snmperr.SNMP_E_BAD_OID)
+    test.case("an arc cut short, an arc that begins with the padding octet 0x80, an arc over 32 bits")
+    var c: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var c, [0x2B, 0x86])
+    test.assert_eq(snmpoid.oid_read(var c, 0, 2, var r), snmperr.SNMP_E_BAD_OID)
+    test.assert_eq(snmpoid.oid_len(var r), 0)
+    var d: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var d, [0x2B, 0x80, 0x01])
+    test.assert_eq(snmpoid.oid_read(var d, 0, 3, var r), snmperr.SNMP_E_BAD_OID)
+    var e: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var e, [0x2B, 0x90, 0x80, 0x80, 0x80, 0x00])
+    test.assert_eq(snmpoid.oid_read(var e, 0, 6, var r), snmperr.SNMP_E_BAD_OID)
+    var g: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var g, [0x2B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F])
+    test.assert_eq(snmpoid.oid_read(var g, 0, 12, var r), snmperr.SNMP_E_BAD_OID)
+    test.case("more arcs than an identifier holds")
+    var h: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var h, [0x2B])
+    for _i in 0..30
+        let _ok = snmpber.put_byte(var h, 0x01)
+    test.assert_eq(snmpoid.oid_read(var h, 0, 31, var r), snmperr.SNMP_E_OID_TOO_LONG)
+    test.assert_eq(snmpoid.oid_len(var r), 0)
+    test.case("a first octet pair that unpacks past the table")
+    var k: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var k, [0x7F])
+    test.assert_eq(snmpoid.oid_read(var k, 0, 1, var r), snmperr.SNMP_OK)
+    test.assert_eq(snmpoid.oid_arc(var r, 0), 2)
+    test.assert_eq(snmpoid.oid_arc(var r, 1), 47)

@@ -1,0 +1,647 @@
+// snmp_session_tests.nv — a manager's session driven with datagrams, the
+// agent played by hand.
+//
+// No test opens a socket.  The datagram the session builds is read back
+// with the package's own reader and the agent's answer is built with its
+// own writer, so these tests check the session's rules, the request-id,
+// the retries, the walk and the engine discovery.  The bytes of the
+// messages themselves are fixed by `snmp_pdu_tests.nv` and
+// `snmp_v3_tests.nv`, from hand-derived vectors.
+
+use std.test
+use snmpber
+use snmperr
+use snmpoid
+use snmppdu
+use snmpsession
+use snmpv3
+
+fn oid_of(text: Str) -> SnmpOid
+    var o = snmpoid.oid_empty()
+    let _ok = snmpoid.oid_parse(var o, text)
+    o
+
+fn get_pdu(tag: Int, text: Str) -> SnmpPdu
+    var p = snmppdu.pdu_new(tag, 0)
+    var o = oid_of(text)
+    let _ok = snmppdu.add_null(var p, var o)
+    p
+
+// The table the test agent serves, in order.
+fn table() -> [Str]
+    ["1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.2.0", "1.3.6.1.2.1.1.3.0", "1.3.6.1.2.1.1.4.0", "1.3.6.1.2.1.1.5.0",
+     "1.3.6.1.2.1.1.6.0", "1.3.6.1.2.1.1.7.0", "1.3.6.1.2.1.2.1.0", "1.3.6.1.2.1.2.2.1.1.1"]
+
+// The index of the first table entry after `name`, or the table's length.
+fn next_index(var name: SnmpOid) -> Int
+    let t = table()
+    for i in 0..list.len(t)
+        var e = oid_of(t[i])
+        if snmpoid.oid_compare(var e, var name) > 0
+            return i
+    list.len(t)
+
+// The agent's answer to a request: a Response with the same request-id.
+// Get returns the name with an Integer32 of 1, GetNext the next table
+// entry, GetBulk the next `error_index` entries, and a name past the end of
+// the table is endOfMibView.
+fn answer(var req: snmpber.SnmpBuf, version: Int, community: Str) -> snmpber.SnmpBuf
+    var info = snmppdu.info_new()
+    let _c = snmppdu.msg_decode(var req, var info)
+    var q = snmppdu.pdu_new(0, 0)
+    let _d = snmppdu.pdu_decode(var req, info.pdu_off, info.pdu_end, var q)
+    var r = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, q.request_id)
+    let t = table()
+    if q.tag == snmppdu.SNMP_PDU_GET
+        let _a = snmppdu.add_integer(var r, var q.vbs[0].oid, 1)
+    elif q.tag == snmppdu.SNMP_PDU_GET_NEXT
+        let i = next_index(var q.vbs[0].oid)
+        if i < list.len(t)
+            var e = oid_of(t[i])
+            let _b = snmppdu.add_integer(var r, var e, 1)
+        else
+            let _x = snmppdu.add(var r, var q.vbs[0].oid, snmppdu.SNMP_V_END_OF_MIB_VIEW, 0, 0, 0)
+    else
+        var i = next_index(var q.vbs[0].oid)
+        for _k in 0..q.error_index
+            if i < list.len(t)
+                var e = oid_of(t[i])
+                let _b = snmppdu.add_integer(var r, var e, 1)
+                i = i + 1
+            else
+                let _x = snmppdu.add(var r, var q.vbs[0].oid, snmppdu.SNMP_V_END_OF_MIB_VIEW, 0, 0, 0)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var pool: snmpber.SnmpBuf = Vec.new()
+    let _e = snmppdu.msg_encode(var out, version, community, var r, var pool)
+    out
+
+// A Response with the given status and index and one Integer32 binding.
+fn response(version: Int, community: Str, id: Int, status: Int, index: Int, name: Str) -> snmpber.SnmpBuf
+    var r = SnmpPdu { tag: snmppdu.SNMP_PDU_RESPONSE, request_id: id, error_status: status, error_index: index,
+                      vbs: Vec.new() }
+    var o = oid_of(name)
+    let _a = snmppdu.add_integer(var r, var o, 1)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var pool: snmpber.SnmpBuf = Vec.new()
+    let _b = snmppdu.msg_encode(var out, version, community, var r, var pool)
+    out
+
+// The request-id of a message the session built.
+fn id_of(var b: snmpber.SnmpBuf) -> Int
+    var info = snmppdu.info_new()
+    let _c = snmppdu.msg_decode(var b, var info)
+    var q = snmppdu.pdu_new(0, 0)
+    let _d = snmppdu.pdu_decode(var b, info.pdu_off, info.pdu_end, var q)
+    q.request_id
+
+@test
+fn test_a_get_and_its_answer() [io]
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpsession.is_idle(s))
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert(not snmpsession.is_idle(s))
+    test.assert_eq(id_of(var out), 100)
+    test.case("the answer ends the request and is handed over")
+    var inb = answer(var out, snmppdu.SNMP_V2C, "public")
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    let st = snmpsession.on_datagram(var s, var inb, var r, var next)
+    test.assert(st.done)
+    test.assert(st.deliver)
+    test.assert_eq(st.count, 1)
+    test.assert_eq(st.status, 0)
+    test.assert_eq(r.vbs[0].num, 1)
+    test.assert(snmpsession.is_idle(s))
+    test.case("the next request takes the next request-id")
+    var p2 = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.5.0")
+    test.assert_eq(snmpsession.request(var s, var p2, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(id_of(var out), 101)
+
+@test
+fn test_an_error_status_is_an_answer() [io]
+    var s = snmpsession.session_new(snmppdu.SNMP_V1, "public", 7)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.99.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    var inb = response(snmppdu.SNMP_V1, "public", 7, snmperr.SNMP_NO_SUCH_NAME, 1, "1.3.6.1.2.1.99.1.0")
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    let st = snmpsession.on_datagram(var s, var inb, var r, var next)
+    test.assert(st.done)
+    test.assert(not st.failed)
+    test.assert_eq(st.status, snmperr.SNMP_NO_SUCH_NAME)
+    test.assert_eq(st.index, 1)
+
+@test
+fn test_datagrams_that_are_not_the_answer_are_ignored() [io]
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    test.case("nothing is in flight")
+    var early = response(snmppdu.SNMP_V2C, "public", 100, 0, 0, "1.3.6.1.2.1.1.1.0")
+    test.assert(snmpsession.on_datagram(var s, var early, var r, var next).ignored)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.case("another request-id, community, version, or a garbled datagram")
+    var wrong_id = response(snmppdu.SNMP_V2C, "public", 99, 0, 0, "1.3.6.1.2.1.1.1.0")
+    test.assert(snmpsession.on_datagram(var s, var wrong_id, var r, var next).ignored)
+    var wrong_comm = response(snmppdu.SNMP_V2C, "private", 100, 0, 0, "1.3.6.1.2.1.1.1.0")
+    test.assert(snmpsession.on_datagram(var s, var wrong_comm, var r, var next).ignored)
+    var short_comm = response(snmppdu.SNMP_V2C, "pub", 100, 0, 0, "1.3.6.1.2.1.1.1.0")
+    test.assert(snmpsession.on_datagram(var s, var short_comm, var r, var next).ignored)
+    var wrong_ver = response(snmppdu.SNMP_V1, "public", 100, 0, 0, "1.3.6.1.2.1.1.1.0")
+    test.assert(snmpsession.on_datagram(var s, var wrong_ver, var r, var next).ignored)
+    var junk = out
+    junk[0] = 0x31
+    test.assert(snmpsession.on_datagram(var s, var junk, var r, var next).ignored)
+    test.case("a request echoed back is not a Response")
+    test.assert(snmpsession.on_datagram(var s, var out, var r, var next).ignored)
+    test.case("a Response with a bad PDU")
+    var bad = response(snmppdu.SNMP_V2C, "public", 100, 0, 0, "1.3.6.1.2.1.1.1.0")
+    bad[bad.len() - 3] = 0x77
+    test.assert(snmpsession.on_datagram(var s, var bad, var r, var next).ignored)
+    test.case("the request is still in flight, and the right answer completes it")
+    var good = response(snmppdu.SNMP_V2C, "public", 100, 0, 0, "1.3.6.1.2.1.1.1.0")
+    test.assert(snmpsession.on_datagram(var s, var good, var r, var next).done)
+
+@test
+fn test_retries_keep_the_request_id() [io]
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    snmpsession.set_limits(var s, 1000, 3)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.case("a wait that is not over does nothing")
+    test.assert_eq(snmpsession.tick(var s, 400).action, snmpsession.SNMP_ACT_NONE)
+    test.assert_eq(snmpsession.tick(var s, 500).action, snmpsession.SNMP_ACT_NONE)
+    test.case("the wait over sends the same datagram again, twice")
+    test.assert_eq(snmpsession.tick(var s, 100).action, snmpsession.SNMP_ACT_RESEND)
+    test.assert_eq(snmpsession.tick(var s, 1000).action, snmpsession.SNMP_ACT_RESEND)
+    test.case("the third wait over fails with a timeout, and the session is free")
+    let t = snmpsession.tick(var s, 1000)
+    test.assert(t.failed)
+    test.assert_eq(t.reason, snmpsession.SNMP_FAIL_TIMEOUT)
+    test.assert(snmpsession.is_idle(s))
+    test.assert_eq(snmpsession.tick(var s, 1000).action, snmpsession.SNMP_ACT_NONE)
+    test.case("a late answer to the first send still matches while a resend waits")
+    var p2 = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    test.assert_eq(snmpsession.request(var s, var p2, var pool, var out), snmperr.SNMP_OK)
+    let id = id_of(var out)
+    test.assert_eq(snmpsession.tick(var s, 1000).action, snmpsession.SNMP_ACT_RESEND)
+    var late = response(snmppdu.SNMP_V2C, "public", id, 0, 0, "1.3.6.1.2.1.1.1.0")
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmpsession.on_datagram(var s, var late, var r, var next).done)
+    test.case("a negative number of milliseconds is ignored")
+    var p3 = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    test.assert_eq(snmpsession.request(var s, var p3, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(snmpsession.tick(var s, -5).action, snmpsession.SNMP_ACT_NONE)
+
+@test
+fn test_limits_and_the_request_id() [io]
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    test.assert_eq(s.timeout_ms, snmpsession.SNMP_TIMEOUT_DEFAULT)
+    test.assert_eq(s.max_tries, snmpsession.SNMP_TRIES_DEFAULT)
+    snmpsession.set_limits(var s, 0, 0)
+    test.assert_eq(s.timeout_ms, snmpsession.SNMP_TIMEOUT_DEFAULT)
+    test.assert_eq(s.max_tries, snmpsession.SNMP_TRIES_DEFAULT)
+    snmpsession.set_limits(var s, 250, 2)
+    test.assert_eq(s.timeout_ms, 250)
+    test.assert_eq(s.max_tries, 2)
+    snmpsession.set_max_repetitions(var s, 0)
+    test.assert_eq(s.max_rep, snmppdu.SNMP_VARBINDS_MAX)
+    snmpsession.set_max_repetitions(var s, 9)
+    test.assert_eq(s.max_rep, snmppdu.SNMP_VARBINDS_MAX)
+    snmpsession.set_max_repetitions(var s, 3)
+    test.assert_eq(s.max_rep, 3)
+    test.case("the request-id wraps from 2147483647 to 1, and a bad seed starts at 1")
+    var w = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 2147483647)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.request(var w, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(id_of(var out), 2147483647)
+    let _t = snmpsession.tick(var w, 100000)
+    let _u = snmpsession.tick(var w, 100000)
+    let _v = snmpsession.tick(var w, 100000)
+    test.assert_eq(snmpsession.request(var w, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(id_of(var out), 1)
+    let z = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 0)
+    test.assert_eq(z.next_id, 1)
+    let big = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 2147483648)
+    test.assert_eq(big.next_id, 1)
+
+@test
+fn test_requests_that_are_refused() [io]
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.case("a PDU that is not a request")
+    var resp = get_pdu(snmppdu.SNMP_PDU_RESPONSE, "1.3.6.1.2.1.1.1.0")
+    test.assert_eq(snmpsession.request(var s, var resp, var pool, var out), snmperr.SNMP_E_BAD_PDU)
+    test.case("a GetBulk in an SNMPv1 session cannot be written")
+    var v1 = snmpsession.session_new(snmppdu.SNMP_V1, "public", 1)
+    var bulk = get_pdu(snmppdu.SNMP_PDU_GET_BULK, "1.3.6.1.2.1.1.1.0")
+    test.assert_eq(snmpsession.request(var v1, var bulk, var pool, var out), snmperr.SNMP_E_BAD_PDU)
+    test.case("a request while another is in flight")
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_E_WRONG_STATE)
+    var root = oid_of("1.3.6.1.2.1.1")
+    test.assert_eq(snmpsession.walk(var s, var root, var out), snmperr.SNMP_E_WRONG_STATE)
+    test.assert_eq(snmpsession.discover(var s, var out), snmperr.SNMP_E_WRONG_STATE)
+    test.case("a walk of a root with one arc, and discovery in a v2c session")
+    var one = oid_of("1")
+    var idle = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 1)
+    test.assert_eq(snmpsession.walk(var idle, var one, var out), snmperr.SNMP_E_BAD_ARGUMENT)
+    test.assert_eq(snmpsession.discover(var idle, var out), snmperr.SNMP_E_WRONG_STATE)
+
+@test
+fn test_set_and_get_bulk() [io]
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "private", 5)
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_SET, 0)
+    var o = oid_of("1.3.6.1.2.1.1.5.0")
+    let off = snmppdu.pool_add_str(var pool, "router-1")
+    test.assert(snmppdu.add_span(var p, var o, snmppdu.SNMP_V_OCTETS, off, 8))
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    var info = snmppdu.info_new()
+    test.assert_eq(snmppdu.msg_decode(var out, var info), snmperr.SNMP_OK)
+    test.assert_eq(info.pdu_tag, snmppdu.SNMP_PDU_SET)
+    test.case("a SetRequest is answered like any other")
+    var inb = response(snmppdu.SNMP_V2C, "private", 5, snmperr.SNMP_NOT_WRITABLE, 1, "1.3.6.1.2.1.1.5.0")
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    let st = snmpsession.on_datagram(var s, var inb, var r, var next)
+    test.assert(st.done)
+    test.assert_eq(st.status, snmperr.SNMP_NOT_WRITABLE)
+
+    test.case("a GetBulk keeps its two numbers")
+    var b = SnmpPdu { tag: snmppdu.SNMP_PDU_GET_BULK, request_id: 0, error_status: 0, error_index: 4, vbs: Vec.new() }
+    let _x = snmppdu.add_null(var b, var o)
+    test.assert_eq(snmpsession.request(var s, var b, var pool, var out), snmperr.SNMP_OK)
+    var inb2 = answer(var out, snmppdu.SNMP_V2C, "private")
+    var r2 = snmppdu.pdu_new(0, 0)
+    let st2 = snmpsession.on_datagram(var s, var inb2, var r2, var next)
+    test.assert(st2.done)
+    test.assert_eq(st2.count, 4)
+
+fn collect(var s: SnmpSession, version: Int, root: Str) -> Str
+    // Run a whole walk against the test agent and answer the names it
+    // delivered, in order, with a verdict.
+    var r_root = oid_of(root)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var seen: [Str] = []
+    var verdict = ""
+    if snmpsession.walk(var s, var r_root, var out) != snmperr.SNMP_OK
+        return "walk refused"
+    for _i in 0..20
+        if str.len(verdict) == 0
+            var inb = answer(var out, version, "public")
+            var r = snmppdu.pdu_new(0, 0)
+            let st = snmpsession.on_datagram(var s, var inb, var r, var out)
+            if st.deliver
+                for k in 0..st.count
+                    list.push(seen, str.from_int(snmpoid.oid_arc(var r.vbs[k].oid, 7)))
+            if st.done
+                verdict = "done"
+            if st.failed
+                verdict = "failed " + str.from_int(st.reason)
+    str.join(seen, ",") + " " + verdict
+
+@test
+fn test_a_walk_with_get_bulk() [io]
+    // The agent serves seven entries under 1.3.6.1.2.1.1 (arcs 1 to 7 at
+    // index 9 of the name) and two under 2.
+    test.case("a bulk of three")
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    snmpsession.set_max_repetitions(var s, 3)
+    test.assert_eq(collect(var s, snmppdu.SNMP_V2C, "1.3.6.1.2.1.1"), "1,2,3,4,5,6,7 done")
+    test.assert(snmpsession.is_idle(s))
+    test.case("a bulk of eight")
+    var t = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    test.assert_eq(collect(var t, snmppdu.SNMP_V2C, "1.3.6.1.2.1.1"), "1,2,3,4,5,6,7 done")
+    test.case("a walk that ends with endOfMibView")
+    var u = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    test.assert_eq(collect(var u, snmppdu.SNMP_V2C, "1.3.6.1.2.1.2"), "1,2 done")
+    test.case("a subtree with nothing in it")
+    var v = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    test.assert_eq(collect(var v, snmppdu.SNMP_V2C, "1.3.6.1.2.1.9"), " done")
+    test.case("a walk of a single object ends at the first name outside it")
+    var w = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    test.assert_eq(collect(var w, snmppdu.SNMP_V2C, "1.3.6.1.2.1.1.3.0"), " done")
+
+@test
+fn test_a_walk_with_get_next() [io]
+    test.case("SNMPv1 walks with GetNext, a name at a time")
+    var s = snmpsession.session_new(snmppdu.SNMP_V1, "public", 100)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var root = oid_of("1.3.6.1.2.1.1")
+    test.assert_eq(snmpsession.walk(var s, var root, var out), snmperr.SNMP_OK)
+    var info = snmppdu.info_new()
+    test.assert_eq(snmppdu.msg_decode(var out, var info), snmperr.SNMP_OK)
+    test.assert_eq(info.pdu_tag, snmppdu.SNMP_PDU_GET_NEXT)
+    var t = snmpsession.session_new(snmppdu.SNMP_V1, "public", 100)
+    test.assert_eq(collect(var t, snmppdu.SNMP_V1, "1.3.6.1.2.1.1"), "1,2,3,4,5,6,7 done")
+
+    // An SNMPv1 agent ends a walk with noSuchName for the name after the
+    // last (RFC 1157 section 4.1.3).
+    test.case("an SNMPv1 agent's noSuchName ends the walk")
+    var u = snmpsession.session_new(snmppdu.SNMP_V1, "public", 5)
+    var root2 = oid_of("1.3.6.1.2.1.1")
+    test.assert_eq(snmpsession.walk(var u, var root2, var out), snmperr.SNMP_OK)
+    var inb = response(snmppdu.SNMP_V1, "public", 5, snmperr.SNMP_NO_SUCH_NAME, 1, "1.3.6.1.2.1.1")
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    let st = snmpsession.on_datagram(var u, var inb, var r, var next)
+    test.assert(st.done)
+    test.assert_eq(st.status, 0)
+    test.assert(not st.deliver)
+    test.case("another error ends it with that status")
+    var v = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 5)
+    test.assert_eq(snmpsession.walk(var v, var root2, var out), snmperr.SNMP_OK)
+    var inb2 = response(snmppdu.SNMP_V2C, "public", 5, snmperr.SNMP_GEN_ERR, 1, "1.3.6.1.2.1.1")
+    let st2 = snmpsession.on_datagram(var v, var inb2, var r, var next)
+    test.assert(st2.done)
+    test.assert_eq(st2.status, snmperr.SNMP_GEN_ERR)
+    test.case("noSuchName from an SNMPv2c agent is an error status, not the end")
+    var w = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 5)
+    test.assert_eq(snmpsession.walk(var w, var root2, var out), snmperr.SNMP_OK)
+    var inb3 = response(snmppdu.SNMP_V2C, "public", 5, snmperr.SNMP_NO_SUCH_NAME, 1, "1.3.6.1.2.1.1")
+    test.assert_eq(snmpsession.on_datagram(var w, var inb3, var r, var next).status, snmperr.SNMP_NO_SUCH_NAME)
+
+@test
+fn test_a_walk_that_does_not_advance() [io]
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 5)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var root = oid_of("1.3.6.1.2.1.1")
+    test.assert_eq(snmpsession.walk(var s, var root, var out), snmperr.SNMP_OK)
+    test.case("a first binding that repeats the root")
+    var inb = response(snmppdu.SNMP_V2C, "public", 5, 0, 0, "1.3.6.1.2.1.1")
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    let st = snmpsession.on_datagram(var s, var inb, var r, var next)
+    test.assert(st.failed)
+    test.assert_eq(st.reason, snmpsession.SNMP_FAIL_NOT_INCREASING)
+    test.assert(snmpsession.is_idle(s))
+    test.case("a later binding that goes back after one that advanced")
+    var t = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 5)
+    test.assert_eq(snmpsession.walk(var t, var root, var out), snmperr.SNMP_OK)
+    var q = SnmpPdu { tag: snmppdu.SNMP_PDU_RESPONSE, request_id: 5, error_status: 0, error_index: 0, vbs: Vec.new() }
+    var a = oid_of("1.3.6.1.2.1.1.2.0")
+    var b = oid_of("1.3.6.1.2.1.1.1.0")
+    let _x = snmppdu.add_integer(var q, var a, 1)
+    let _y = snmppdu.add_integer(var q, var b, 1)
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var inb2: snmpber.SnmpBuf = Vec.new()
+    let _z = snmppdu.msg_encode(var inb2, snmppdu.SNMP_V2C, "public", var q, var pool)
+    let st2 = snmpsession.on_datagram(var t, var inb2, var r, var next)
+    test.assert(st2.failed)
+    test.assert(st2.deliver)
+    test.assert_eq(st2.count, 1)
+    test.case("an answer with no bindings ends the walk")
+    var u = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 5)
+    test.assert_eq(snmpsession.walk(var u, var root, var out), snmperr.SNMP_OK)
+    var empty = SnmpPdu { tag: snmppdu.SNMP_PDU_RESPONSE, request_id: 5, error_status: 0, error_index: 0, vbs: Vec.new() }
+    var inb3: snmpber.SnmpBuf = Vec.new()
+    let _w = snmppdu.msg_encode(var inb3, snmppdu.SNMP_V2C, "public", var empty, var pool)
+    let st3 = snmpsession.on_datagram(var u, var inb3, var r, var next)
+    test.assert(st3.done)
+    test.assert(not st3.deliver)
+    test.case("a walk whose next request cannot be written ends it")
+    var v = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 5)
+    test.assert_eq(snmpsession.walk(var v, var root, var out), snmperr.SNMP_OK)
+    var inb4 = response(snmppdu.SNMP_V2C, "public", 5, 0, 0, "1.3.6.1.2.1.1.1.0")
+    var tiny: snmpber.SnmpBuf = Vec.new()
+    for _i in 0..snmpber.SNMP_MSG_MAX
+        let _ok = snmpber.put_byte(var tiny, 0)
+    let st4 = snmpsession.on_datagram(var v, var inb4, var r, var tiny)
+    test.assert(st4.done or st4.failed or st4.action == snmpsession.SNMP_ACT_SEND)
+
+// A v3 message the agent sends: a scoped PDU with the given PDU, from the
+// engine "engine" at boots 3 and the given time.
+fn v3_message(msg_id: Int, flags: Int, time: Int, var p: SnmpPdu) -> snmpber.SnmpBuf
+    var id: snmpber.SnmpName = Vec.new()
+    let _a = snmpber.name_set(var id, "engine")
+    var sc = SnmpScoped { context_engine: id, context_name: Vec.new() }
+    var data: snmpber.SnmpBuf = Vec.new()
+    var pool: snmpber.SnmpBuf = Vec.new()
+    let _b = snmpv3.scoped_encode(var data, var sc, var p, var pool)
+    var user: snmpber.SnmpName = Vec.new()
+    let _c = snmpber.name_set(var user, "bert")
+    var auth: Vec[u8; 48] = Vec.new()
+    if (flags & 1) != 0
+        for _i in 0..12
+            let _d = auth.push(0)
+    var u = SnmpUsm { engine_id: id, boots: 3, time: time, user: user, auth_params: auth, priv_params: Vec.new() }
+    let h = SnmpV3Header { msg_id: msg_id, max_size: 1472, flags: flags, model: 3 }
+    var lay = snmpv3.layout_empty()
+    var out: snmpber.SnmpBuf = Vec.new()
+    let _e = snmpv3.v3_encode(var out, h, var u, var data, false, var lay)
+    out
+
+fn report_of(arc: Int, id: Int) -> SnmpPdu
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_REPORT, id)
+    var o = oid_of("1.3.6.1.6.3.15.1.1." + str.from_int(arc) + ".0")
+    let _ok = snmppdu.add(var p, var o, snmppdu.SNMP_V_COUNTER32, 1, 0, 0)
+    p
+
+@test
+fn test_engine_discovery() [io]
+    var s = snmpsession.session_v3("bert", 0, 0, 100)
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.discover(var s, var out), snmperr.SNMP_OK)
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    test.assert_eq(h.flags, snmpv3.SNMP_FLAG_REPORTABLE)
+    test.assert_eq(u.engine_id.len(), 0)
+    test.assert_eq(u.user.len(), 0)
+    test.case("the Report carries the engine ID, boots and time")
+    var rep = report_of(4, 100)
+    var inb = v3_message(h.msg_id, 0, 1234, var rep)
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    let st = snmpsession.on_datagram(var s, var inb, var r, var next)
+    test.assert(st.done)
+    test.assert_eq(st.report, 4)
+    test.assert_eq(s.usm.engine_id.len(), 6)
+    test.assert_eq(s.sync.boots, 3)
+    test.assert_eq(snmpsession.engine_time(s), 1234)
+    test.case("a request after discovery carries the engine ID, boots and time")
+    let _t = snmpsession.tick(var s, 5000)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    test.assert_eq(u.engine_id.len(), 6)
+    test.assert_eq(u.boots, 3)
+    test.assert_eq(u.time, 1239)
+    test.assert_eq(u.user.len(), 4)
+    test.assert_eq(h.flags, snmpv3.SNMP_FLAG_REPORTABLE)
+    test.case("and its answer, a Response in the same scope, is handed over")
+    var resp = SnmpPdu { tag: snmppdu.SNMP_PDU_RESPONSE, request_id: id_of_v3(var out), error_status: 0,
+                         error_index: 0, vbs: Vec.new() }
+    var o = oid_of("1.3.6.1.2.1.1.1.0")
+    let _i = snmppdu.add_integer(var resp, var o, 5)
+    var inb2 = v3_message(h.msg_id, 0, 1240, var resp)
+    let st2 = snmpsession.on_datagram(var s, var inb2, var r, var next)
+    test.assert(st2.done)
+    test.assert(st2.deliver)
+
+fn id_of_v3(var b: snmpber.SnmpBuf) -> Int
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    let _c = snmpv3.v3_decode(var b, var h, var u, var lay)
+    var sc = snmpv3.scoped_empty()
+    var q = snmppdu.pdu_new(0, 0)
+    let _d = snmpv3.scoped_decode(var b, lay.data_off, lay.body_off + lay.body_len, var sc, var q)
+    q.request_id
+
+@test
+fn test_reports_that_are_not_discovery() [io]
+    var s = snmpsession.session_v3("bert", 1, 12, 100)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    var id: snmpber.SnmpName = Vec.new()
+    let _a = snmpber.name_set(var id, "engine")
+    snmpsession.engine_known(var s, var id, 3, 1000)
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.case("an authenticated request carries zeroed authentication parameters of the user's length")
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    test.assert_eq(h.flags, snmpv3.SNMP_FLAG_AUTH | snmpv3.SNMP_FLAG_REPORTABLE)
+    test.assert_eq(lay.auth_len, 12)
+    test.assert_eq(out[lay.auth_off] as Int, 0)
+    test.case("a Report for a wrong digest fails the request, with the counter")
+    var rep = report_of(5, id_of_v3(var out))
+    var inb = v3_message(h.msg_id, 0, 1001, var rep)
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    let st = snmpsession.on_datagram(var s, var inb, var r, var next)
+    test.assert(st.failed)
+    test.assert_eq(st.reason, snmpsession.SNMP_FAIL_REPORT)
+    test.assert_eq(st.report, 5)
+    test.case("a Report whose name is not a usmStats counter has report 0")
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    var odd = snmppdu.pdu_new(snmppdu.SNMP_PDU_REPORT, id_of_v3(var out))
+    var o = oid_of("1.3.6.1.2.1.1.1.0")
+    let _b = snmppdu.add_null(var odd, var o)
+    var inb2 = v3_message(h.msg_id, 0, 1002, var odd)
+    test.assert_eq(snmpsession.on_datagram(var s, var inb2, var r, var next).report, 0)
+    test.case("a Report with no bindings has report 0")
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    var none = snmppdu.pdu_new(snmppdu.SNMP_PDU_REPORT, 1)
+    var inb3 = v3_message(h.msg_id, 0, 1003, var none)
+    test.assert_eq(snmpsession.on_datagram(var s, var inb3, var r, var next).report, 0)
+
+@test
+fn test_v3_responses_are_checked() [io]
+    var s = snmpsession.session_v3("bert", 1, 12, 100)
+    var id: snmpber.SnmpName = Vec.new()
+    let _a = snmpber.name_set(var id, "engine")
+    snmpsession.engine_known(var s, var id, 3, 1000)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    let rid = id_of_v3(var out)
+    var resp = SnmpPdu { tag: snmppdu.SNMP_PDU_RESPONSE, request_id: rid, error_status: 0, error_index: 0, vbs: Vec.new() }
+    var o = oid_of("1.3.6.1.2.1.1.1.0")
+    let _i = snmppdu.add_integer(var resp, var o, 5)
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    test.case("another message ID is ignored")
+    var wrong = v3_message(h.msg_id + 1, 1, 1001, var resp)
+    test.assert(snmpsession.on_datagram(var s, var wrong, var r, var next).ignored)
+    test.case("another request-id is ignored")
+    var other = SnmpPdu { tag: snmppdu.SNMP_PDU_RESPONSE, request_id: rid + 1, error_status: 0, error_index: 0, vbs: resp.vbs }
+    var wrong2 = v3_message(h.msg_id, 1, 1001, var other)
+    test.assert(snmpsession.on_datagram(var s, var wrong2, var r, var next).ignored)
+    test.case("a request in the Response's place is ignored")
+    var asked = SnmpPdu { tag: snmppdu.SNMP_PDU_GET, request_id: rid, error_status: 0, error_index: 0, vbs: resp.vbs }
+    var wrong3 = v3_message(h.msg_id, 1, 1001, var asked)
+    test.assert(snmpsession.on_datagram(var s, var wrong3, var r, var next).ignored)
+    test.case("an encrypted message that was not opened is ignored")
+    var cipher: snmpber.SnmpBuf = Vec.new()
+    for x in [1, 2, 3, 4, 5, 6, 7, 8]
+        let _b = snmpber.put_byte(var cipher, x)
+    var hh = SnmpV3Header { msg_id: h.msg_id, max_size: 1472, flags: 7, model: 3 }
+    var uu = snmpv3.usm_empty()
+    var enc: snmpber.SnmpBuf = Vec.new()
+    var l2 = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_encode(var enc, hh, var uu, var cipher, true, var l2), snmperr.SNMP_OK)
+    test.assert(snmpsession.on_datagram(var s, var enc, var r, var next).ignored)
+    test.case("a scoped PDU that does not parse is ignored")
+    var broken = v3_message(h.msg_id, 1, 1001, var resp)
+    broken[broken.len() - 3] = 0x55
+    test.assert(snmpsession.on_datagram(var s, var broken, var r, var next).ignored)
+    test.case("an authenticated Response in the window completes the request")
+    var good = v3_message(h.msg_id, 1, 1001, var resp)
+    let st = snmpsession.on_datagram(var s, var good, var r, var next)
+    test.assert(st.done)
+    test.assert(st.deliver)
+    test.assert_eq(s.sync.latest, 1001)
+
+@test
+fn test_a_v3_response_outside_the_time_window() [io]
+    var s = snmpsession.session_v3("bert", 1, 12, 100)
+    var id: snmpber.SnmpName = Vec.new()
+    let _a = snmpber.name_set(var id, "engine")
+    snmpsession.engine_known(var s, var id, 3, 1000)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    var resp = SnmpPdu { tag: snmppdu.SNMP_PDU_RESPONSE, request_id: id_of_v3(var out), error_status: 0,
+                         error_index: 0, vbs: Vec.new() }
+    var old = v3_message(h.msg_id, 1, 700, var resp)
+    var r = snmppdu.pdu_new(0, 0)
+    var next: snmpber.SnmpBuf = Vec.new()
+    let st = snmpsession.on_datagram(var s, var old, var r, var next)
+    test.assert(st.failed)
+    test.assert_eq(st.reason, snmpsession.SNMP_FAIL_TIME_WINDOW)
+    test.assert(snmpsession.is_idle(s))
+
+@test
+fn test_a_v3_walk_uses_the_context() [io]
+    var s = snmpsession.session_v3("bert", 0, 0, 100)
+    var id: snmpber.SnmpName = Vec.new()
+    let _a = snmpber.name_set(var id, "engine")
+    snmpsession.engine_known(var s, var id, 3, 1000)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var root = oid_of("1.3.6.1.2.1.1")
+    test.assert_eq(snmpsession.walk(var s, var root, var out), snmperr.SNMP_OK)
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_decode(var out, var h, var u, var lay), snmperr.SNMP_OK)
+    var sc = snmpv3.scoped_empty()
+    var q = snmppdu.pdu_new(0, 0)
+    test.assert_eq(snmpv3.scoped_decode(var out, lay.data_off, lay.body_off + lay.body_len, var sc, var q), snmperr.SNMP_OK)
+    test.assert_eq(q.tag, snmppdu.SNMP_PDU_GET_BULK)
+    test.assert_eq(sc.context_engine.len(), 6)
+    test.assert_eq(q.error_index, snmppdu.SNMP_VARBINDS_MAX)

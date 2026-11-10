@@ -1,0 +1,471 @@
+// snmpber.nv — the BER that SNMP uses, written into and read from a
+// buffer the caller owns, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  SNMP uses a small
+// part of BER (RFC 3417 section 8): definite lengths only, the
+// primitive types INTEGER, OCTET STRING, NULL and OBJECT IDENTIFIER, the
+// application types of SMIv2 (IpAddress, Counter32, Gauge32, TimeTicks,
+// Opaque, Counter64), and constructed values for the message, the PDU and
+// the variable bindings.  The identifier and length octets are
+// `asn1tag`'s, from asn1-nv: this module adds the integers, the buffer
+// and the rule for closing a constructed value.
+//
+// A BUFFER of `SNMP_MSG_MAX` bytes holds a whole datagram.  RFC 3417
+// section 3.2 requires an entity to accept messages of 484 bytes and
+// allows more; 1472 is what an Ethernet frame of 1500 bytes leaves for a
+// UDP payload after the IPv4 and UDP headers.
+//
+// A CONSTRUCTED VALUE is written with `begin`, the contents and then
+// `end`.  `begin` answers where the contents start.  `end` puts the
+// identifier and the shortest length in front of them, moving the
+// contents up by the size of that header.  The cost is one move per
+// constructed value, and the gain is that no length is computed before
+// its contents are written.
+
+use std.str
+use asn1tag
+use snmperr
+
+// The largest message this package builds or reads, in bytes: 1472.
+pub const SNMP_MSG_MAX = 1472
+
+// A datagram buffer: the type every function here takes.
+pub alias SnmpBuf = Vec[u8; SNMP_MSG_MAX]
+
+// The longest engine identifier, user name, context name or community
+// string held here: 32 octets (RFC 3411 section 5 limits an engine ID to
+// 32 and a user name to 32).
+pub const SNMP_NAME_MAX = 32
+
+// An octet string of up to `SNMP_NAME_MAX` octets: an engine ID, a user
+// name, a context name or a community string.
+pub alias SnmpName = Vec[u8; SNMP_NAME_MAX]
+
+// INTEGER: 0x02.
+pub const SNMP_TAG_INTEGER = 0x02
+// OCTET STRING: 0x04.
+pub const SNMP_TAG_OCTET_STRING = 0x04
+// NULL: 0x05.
+pub const SNMP_TAG_NULL = 0x05
+// OBJECT IDENTIFIER: 0x06.
+pub const SNMP_TAG_OID = 0x06
+// SEQUENCE: 0x30.
+pub const SNMP_TAG_SEQUENCE = 0x30
+// IpAddress, [APPLICATION 0]: 0x40.
+pub const SNMP_TAG_IPADDRESS = 0x40
+// Counter32, [APPLICATION 1]: 0x41.
+pub const SNMP_TAG_COUNTER32 = 0x41
+// Gauge32 and Unsigned32, [APPLICATION 2]: 0x42.
+pub const SNMP_TAG_GAUGE32 = 0x42
+// TimeTicks, [APPLICATION 3]: 0x43.
+pub const SNMP_TAG_TIMETICKS = 0x43
+// Opaque, [APPLICATION 4]: 0x44.
+pub const SNMP_TAG_OPAQUE = 0x44
+// Counter64, [APPLICATION 6]: 0x46.
+pub const SNMP_TAG_COUNTER64 = 0x46
+// The exception noSuchObject, [CONTEXT 0] with no content: 0x80.
+pub const SNMP_TAG_NO_SUCH_OBJECT = 0x80
+// The exception noSuchInstance, [CONTEXT 1]: 0x81.
+pub const SNMP_TAG_NO_SUCH_INSTANCE = 0x81
+// The exception endOfMibView, [CONTEXT 2]: 0x82.
+pub const SNMP_TAG_END_OF_MIB_VIEW = 0x82
+
+// The result of reading a header at an offset.
+pub @value
+struct SnmpHead
+    // Whether a header was read and its contents fit before the limit.
+    ok: Bool
+    // The identifier octet.
+    tag: Int
+    // The length of the contents.
+    len: Int
+    // The length of the identifier and length octets.
+    hdr: Int
+    // `SNMP_OK`, or why the header was refused.
+    code: Int
+
+// The result of reading an integer.
+pub @value
+struct SnmpNum
+    // Whether the contents were a well-formed integer of the type.
+    ok: Bool
+    // The value.  A Counter64 of 2^63 or more reads as a negative `Int`
+    // holding the same 64 bits.
+    value: Int
+
+// Append one byte.  Answers false when the buffer is full.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpber.put_byte(var b, 0x30)} ${b.len()}")   // true 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_byte(var b: SnmpBuf, v: Int) -> Bool []
+    match b.push((v & 0xFF) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append an identifier and a definite length: the header of a value whose
+// contents are `len` bytes and follow.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let ok = snmpber.put_head(var b, snmpber.SNMP_TAG_SEQUENCE, 300)
+//     println("${ok} ${b.len()}")   // true 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_head(var b: SnmpBuf, tag: Int, len: Int) -> Bool []
+    if len < 0
+        return false
+    let e = asn1tag.emit_length(len)
+    var ok = put_byte(var b, tag)
+    for i in 0..e.len
+        ok = ok and put_byte(var b, e.out[i] as Int)
+    ok
+
+// The number of octets the shortest two's-complement form of `v` takes: 1
+// to 8.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     println("${snmpber.integer_len(127)} ${snmpber.integer_len(128)} ${snmpber.integer_len(-129)}")   // 1 2 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn integer_len(v: Int) -> Int []
+    var n = 1
+    for _i in 0..7
+        let limit = 1 << (8 * n - 1)
+        if v < -limit or v >= limit
+            n = n + 1
+    n
+
+// The number of octets the unsigned form of `v` takes, where `v` holds
+// the 64 bits of a Counter64, so a negative `Int` stands for a value of
+// 2^63 or more: 1 to 9.  A leading zero octet is counted when the top bit
+// of the first octet would otherwise be set.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     println("${snmpber.unsigned_len(127)} ${snmpber.unsigned_len(128)} ${snmpber.unsigned_len(-1)}")   // 1 2 9
+// ```
+pub @tier(embedded)
+@no_alloc
+fn unsigned_len(v: Int) -> Int []
+    var n = 1
+    for k in 1..8
+        if (v >>> (8 * k)) != 0
+            n = k + 1
+    if ((v >>> (8 * (n - 1))) & 0x80) != 0
+        return n + 1
+    n
+
+// Append an INTEGER-like value with the given tag: the shortest
+// two's-complement form of `v`.  Use `SNMP_TAG_INTEGER` for Integer32.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let ok = snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, -129)
+//     println("${ok} ${b.len()} ${b[2] as Int} ${b[3] as Int}")   // true 4 255 127
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_integer(var b: SnmpBuf, tag: Int, v: Int) -> Bool []
+    let n = integer_len(v)
+    var ok = put_head(var b, tag, n)
+    for k in 0..n
+        ok = ok and put_byte(var b, v >>> (8 * (n - 1 - k)))
+    ok
+
+// Append an unsigned value with the given tag, such as Counter32, Gauge32,
+// TimeTicks or Counter64: the shortest form, with a leading zero octet
+// when the top bit would be set.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let ok = snmpber.put_unsigned(var b, snmpber.SNMP_TAG_COUNTER32, 4294967295)
+//     println("${ok} ${b.len()} ${b[2] as Int}")   // true 7 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_unsigned(var b: SnmpBuf, tag: Int, v: Int) -> Bool []
+    let n = unsigned_len(v)
+    var ok = put_head(var b, tag, n)
+    for k in 0..n
+        let shift = 8 * (n - 1 - k)
+        ok = ok and put_byte(var b, if shift >= 64 then 0 else v >>> shift)
+    ok
+
+// Append an OCTET STRING-like value with the given tag whose contents are
+// the bytes of a string.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let ok = snmpber.put_str(var b, snmpber.SNMP_TAG_OCTET_STRING, "public")
+//     println("${ok} ${b.len()}")   // true 8
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_str(var b: SnmpBuf, tag: Int, s: Str) -> Bool []
+    var ok = put_head(var b, tag, str.len(s))
+    for i in 0..str.len(s)
+        ok = ok and put_byte(var b, str.byte_at_or(s, i, 0))
+    ok
+
+// Append the bytes `off` to `off + len` of `src` as they are, with no
+// header.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var src: snmpber.SnmpBuf = Vec.new()
+//     let _a = snmpber.put_str(var src, snmpber.SNMP_TAG_OCTET_STRING, "ab")
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpber.put_raw(var b, var src, 2, 2)} ${b.len()}")   // true 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_raw(var b: SnmpBuf, var src: SnmpBuf, off: Int, len: Int) -> Bool []
+    if off < 0 or len < 0 or off + len > src.len()
+        return false
+    var ok = true
+    for i in 0..len
+        ok = ok and put_byte(var b, src[off + i] as Int)
+    ok
+
+// Append an OCTET STRING-like value with the given tag whose contents are
+// the bytes `off` to `off + len` of `src`.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var src: snmpber.SnmpBuf = Vec.new()
+//     let _a = snmpber.put_str(var src, snmpber.SNMP_TAG_OCTET_STRING, "ab")
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpber.put_span(var b, snmpber.SNMP_TAG_OCTET_STRING, var src, 2, 2)} ${b.len()}")   // true 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_span(var b: SnmpBuf, tag: Int, var src: SnmpBuf, off: Int, len: Int) -> Bool []
+    put_head(var b, tag, len) and put_raw(var b, var src, off, len)
+
+// Note where the contents of a constructed value start.  Pass the answer
+// to `end` after the contents are written.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let mark = snmpber.begin(var b)
+//     let _i = snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, 1)
+//     let ok = snmpber.end(var b, mark, snmpber.SNMP_TAG_SEQUENCE)
+//     println("${ok} ${b.len()}")   // true 5
+// ```
+pub @tier(embedded)
+@no_alloc
+fn begin(var b: SnmpBuf) -> Int []
+    b.len()
+
+// Close a constructed value: put the identifier and the shortest length
+// before the contents written since `mark`.  Answers false when the
+// buffer has no room for the header or `mark` is not a position in it.
+pub @tier(embedded)
+@no_alloc
+fn end(var b: SnmpBuf, mark: Int, tag: Int) -> Bool []
+    if mark < 0 or mark > b.len()
+        return false
+    let n = b.len() - mark
+    let hdr = 1 + asn1tag.length_len(n)
+    for _i in 0..hdr
+        if not put_byte(var b, 0)
+            return false
+    for k in 0..n
+        let i = mark + n - 1 - k
+        b[i + hdr] = b[i]
+    let e = asn1tag.emit_length(n)
+    b[mark] = (tag & 0xFF) as u8
+    for i in 0..e.len
+        b[mark + 1 + i] = e.out[i]
+    true
+
+// A header that was refused.
+@tier(embedded)
+@no_alloc
+fn refused(code: Int) -> SnmpHead []
+    SnmpHead { ok: false, tag: 0, len: 0, hdr: 0, code: code }
+
+// Read the identifier and length at offset `at` and check that the
+// contents end at or before `limit`.
+//
+// Only identifiers of one octet are read, because every SNMP tag is
+// one.  An indefinite length, a long form of more than four octets or
+// contents that run past `limit` are refused, with `SNMP_E_BAD_LENGTH`
+// or `SNMP_E_TRUNCATED`.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let _a = snmpber.put_str(var b, snmpber.SNMP_TAG_OCTET_STRING, "hi")
+//     let h = snmpber.read_head(var b, 0, b.len())
+//     println("${h.ok} ${h.tag} ${h.len} ${h.hdr}")   // true 4 2 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn read_head(var b: SnmpBuf, at: Int, limit: Int) -> SnmpHead []
+    if at < 0 or at >= limit or limit > b.len()
+        return refused(snmperr.SNMP_E_TRUNCATED)
+    var s = asn1tag.head_scan()
+    var i = at
+    for _k in 0..7
+        if not s.done and not s.bad and i < limit
+            s = asn1tag.head_push(s, b[i])
+            i = i + 1
+    if s.bad or s.indefinite or asn1tag.is_high_tag(s.id)
+        return refused(snmperr.SNMP_E_BAD_LENGTH)
+    if not s.done
+        return refused(snmperr.SNMP_E_TRUNCATED)
+    if s.len < 0 or s.len > SNMP_MSG_MAX
+        return refused(snmperr.SNMP_E_BAD_LENGTH)
+    if i + s.len > limit
+        return refused(snmperr.SNMP_E_TRUNCATED)
+    SnmpHead { ok: true, tag: s.id, len: s.len, hdr: s.seen, code: 0 }
+
+// Read `len` bytes at `at` as a signed two's-complement integer of one to
+// eight octets.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let _a = snmpber.put_integer(var b, snmpber.SNMP_TAG_INTEGER, -129)
+//     let n = snmpber.read_integer(var b, 2, 2)
+//     println("${n.ok} ${n.value}")   // true -129
+// ```
+pub @tier(embedded)
+@no_alloc
+fn read_integer(var b: SnmpBuf, at: Int, len: Int) -> SnmpNum []
+    if len < 1 or len > 8 or at < 0 or at + len > b.len()
+        return SnmpNum { ok: false, value: 0 }
+    var v = if (b[at] as Int) >= 128 then -1 else 0
+    for i in 0..len
+        v = (v << 8) | (b[at + i] as Int)
+    SnmpNum { ok: true, value: v }
+
+// Read `len` bytes at `at` as an unsigned integer whose largest value is
+// 2^`bits` - 1, `bits` being 32 or 64.  A leading zero octet is allowed,
+// and an integer whose first octet has the high bit set and no zero
+// before it is read as the positive value, as other implementations do.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let _a = snmpber.put_unsigned(var b, snmpber.SNMP_TAG_COUNTER32, 4294967295)
+//     let n = snmpber.read_unsigned(var b, 2, 5, 32)
+//     println("${n.ok} ${n.value}")   // true 4294967295
+// ```
+pub @tier(embedded)
+@no_alloc
+fn read_unsigned(var b: SnmpBuf, at: Int, len: Int, bits: Int) -> SnmpNum []
+    if len < 1 or len > 9 or at < 0 or at + len > b.len()
+        return SnmpNum { ok: false, value: 0 }
+    var v = 0
+    for i in 0..len
+        v = (v << 8) | (b[at + i] as Int)
+    let first = b[at] as Int
+    let wide = len == 9 and first != 0
+    let long32 = bits == 32 and (len > 5 or (len == 5 and first != 0))
+    SnmpNum { ok: not wide and not long32, value: v }
+
+// Replace the contents of a name with the bytes of a string.  Answers
+// false, leaving the name empty, when the string is longer than 32.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var n: snmpber.SnmpName = Vec.new()
+//     println("${snmpber.name_set(var n, "bert")} ${n.len()}")   // true 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn name_set(var n: SnmpName, s: Str) -> Bool []
+    n.clear()
+    var ok = str.len(s) <= SNMP_NAME_MAX
+    for i in 0..str.len(s)
+        if ok
+            match n.push(str.byte_at_or(s, i, 0) as u8)
+                Ok(_)  => 0
+                Err(_) => ok = false
+    if not ok
+        n.clear()
+    ok
+
+// Append an OCTET STRING whose contents are a name.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var n: snmpber.SnmpName = Vec.new()
+//     let _x = snmpber.name_set(var n, "bert")
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     println("${snmpber.put_name(var b, var n)} ${b.len()}")   // true 6
+// ```
+pub @tier(embedded)
+@no_alloc
+fn put_name(var out: SnmpBuf, var n: SnmpName) -> Bool []
+    var ok = put_head(var out, SNMP_TAG_OCTET_STRING, n.len())
+    for i in 0..n.len()
+        ok = ok and put_byte(var out, n[i] as Int)
+    ok
+
+// Read `len` octets at `at` into a name.  Answers false, leaving the name
+// empty, when there are more than 32 or they lie outside the buffer.
+//
+// ```novo
+// use snmpber
+//
+// fn main() [io]
+//     var b: snmpber.SnmpBuf = Vec.new()
+//     let _x = snmpber.put_str(var b, snmpber.SNMP_TAG_OCTET_STRING, "bert")
+//     var n: snmpber.SnmpName = Vec.new()
+//     println("${snmpber.get_name(var b, 2, 4, var n)} ${n.len()}")   // true 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn get_name(var b: SnmpBuf, at: Int, len: Int, var n: SnmpName) -> Bool []
+    n.clear()
+    if len < 0 or len > SNMP_NAME_MAX or at < 0 or at + len > b.len()
+        return false
+    for i in 0..len
+        let _ok = n.push(b[at + i])
+    true
