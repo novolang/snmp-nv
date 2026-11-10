@@ -343,7 +343,10 @@ fn is_idle(s: SnmpSession) -> Bool []
 @no_alloc
 fn take_id(var s: SnmpSession) -> Int []
     let id = s.next_id
-    s.next_id = if id >= 2147483647 then 1 else id + 1
+    s.next_id = if id >= 2147483647
+        1
+    else
+        id + 1
     id
 
 // An authentication-parameters placeholder: `n` zero octets.
@@ -369,7 +372,7 @@ fn build_message(var s: SnmpSession, var p: SnmpPdu, var pool: SnmpBuf, var out:
         return snmperr.SNMP_E_BAD_PDU
     let authed = (s.level & snmpv3.SNMP_FLAG_AUTH) != 0
     var u = SnmpUsm { engine_id: s.usm.engine_id, boots: s.sync.boots, time: engine_time(s), user: s.usm.user,
-                      auth_params: zeros(if authed then s.auth_len else 0), priv_params: Vec.new() }
+                      auth_params: zeros((if authed then s.auth_len else 0)), priv_params: Vec.new() }
     let flags = (s.level & snmpv3.SNMP_FLAG_AUTH) | snmpv3.SNMP_FLAG_REPORTABLE
     let h = SnmpV3Header { msg_id: s.msg_id, max_size: snmpber.SNMP_MSG_MAX, flags: flags,
                            model: snmpv3.SNMP_USM_MODEL }
@@ -377,7 +380,10 @@ fn build_message(var s: SnmpSession, var p: SnmpPdu, var pool: SnmpBuf, var out:
     let c = snmpv3.v3_encode(var out, h, var u, var data, false, var lay)
     if c == snmperr.SNMP_OK
         s.flight_msg = s.msg_id
-        s.msg_id = if s.msg_id >= 2147483647 then 1 else s.msg_id + 1
+        s.msg_id = if s.msg_id >= 2147483647
+            1
+        else
+            s.msg_id + 1
     c
 
 // Note a request as sent for the first time.
@@ -414,7 +420,7 @@ fn started(var s: SnmpSession, op: Int, id: Int) []
 //     let _y = snmppdu.add_null(var p, var o)
 //     var pool: snmpber.SnmpBuf = Vec.new()
 //     var out: snmpber.SnmpBuf = Vec.new()
-//     println("${snmpsession.request(var s, var p, var pool, var out)} ${out.len()}")   // 0 43
+//     println("${snmpsession.request(var s, var p, var pool, var out)} ${out.len()}")   // 0 40
 // ```
 pub @tier(embedded)
 @no_alloc
@@ -438,8 +444,8 @@ fn request(var s: SnmpSession, var p: SnmpPdu, var pool: SnmpBuf, var out: SnmpB
 fn walk_request(var s: SnmpSession, var out: SnmpBuf) -> Int []
     let id = take_id(var s)
     let bulk = s.version != snmppdu.SNMP_V1
-    var p = SnmpPdu { tag: if bulk then snmppdu.SNMP_PDU_GET_BULK else snmppdu.SNMP_PDU_GET_NEXT, request_id: id,
-                      error_status: 0, error_index: if bulk then s.max_rep else 0, vbs: Vec.new() }
+    var p = SnmpPdu { tag: (if bulk then snmppdu.SNMP_PDU_GET_BULK else snmppdu.SNMP_PDU_GET_NEXT), request_id: id,
+                      error_status: 0, error_index: (if bulk then s.max_rep else 0), vbs: Vec.new() }
     let _added = snmppdu.add_null(var p, var s.cursor)
     var pool: SnmpBuf = Vec.new()
     let c = build_message(var s, var p, var pool, var out)
@@ -465,7 +471,7 @@ fn walk_request(var s: SnmpSession, var out: SnmpBuf) -> Int []
 //     var root = snmpoid.oid_empty()
 //     let _x = snmpoid.oid_parse(var root, "1.3.6.1.2.1.1")
 //     var out: snmpber.SnmpBuf = Vec.new()
-//     println("${snmpsession.walk(var s, var root, var out)} ${out.len()}")   // 0 40
+//     println("${snmpsession.walk(var s, var root, var out)} ${out.len()}")   // 0 38
 // ```
 pub @tier(embedded)
 @no_alloc
@@ -493,7 +499,7 @@ fn walk(var s: SnmpSession, var root: SnmpOid, var out: SnmpBuf) -> Int []
 // fn main() [io]
 //     var s = snmpsession.session_v3("bert", 0, 0, 100)
 //     var out: snmpber.SnmpBuf = Vec.new()
-//     println("${snmpsession.discover(var s, var out)} ${out.len()}")   // 0 54
+//     println("${snmpsession.discover(var s, var out)} ${out.len()}")   // 0 57
 // ```
 pub @tier(embedded)
 @no_alloc
@@ -502,12 +508,18 @@ fn discover(var s: SnmpSession, var out: SnmpBuf) -> Int []
         return snmperr.SNMP_E_WRONG_STATE
     let id = take_id(var s)
     let msg = s.msg_id
-    s.msg_id = if msg >= 2147483647 then 1 else msg + 1
-    if not snmpv3.discovery_request(var out, msg, id)
-        return snmperr.SNMP_E_NO_ROOM
+    s.msg_id = if msg >= 2147483647
+        1
+    else
+        msg + 1
+    let built = snmpv3.discovery_request(var out, msg, id)
     s.flight_msg = msg
-    started(var s, SNMP_OP_DISCOVER, id)
-    snmperr.SNMP_OK
+    if built
+        started(var s, SNMP_OP_DISCOVER, id)
+    if built
+        snmperr.SNMP_OK
+    else
+        snmperr.SNMP_E_NO_ROOM
 
 // Let time pass.  `ms` is the number of milliseconds since the last call
 // or the last send.  While a request is in flight and the wait is not
@@ -636,7 +648,7 @@ fn receive_v3(var s: SnmpSession, var inb: SnmpBuf, var r: SnmpPdu) -> Int []
 fn walk_answer(var s: SnmpSession, var r: SnmpPdu, var out: SnmpBuf) -> SnmpStep []
     if r.error_status != 0
         let end = r.error_status == snmperr.SNMP_NO_SUCH_NAME and s.version == snmppdu.SNMP_V1
-        return finished(var s, if end then 0 else r.error_status, r.error_index, false, 0)
+        return finished(var s, (if end then 0 else r.error_status), r.error_index, false, 0)
     var n = 0
     var more = r.vbs.len() > 0
     for i in 0..r.vbs.len()
@@ -652,11 +664,14 @@ fn walk_answer(var s: SnmpSession, var r: SnmpPdu, var out: SnmpBuf) -> SnmpStep
                 snmpoid.oid_copy(var s.cursor, var r.vbs[i].oid)
     if not more
         return finished(var s, 0, 0, n > 0, n)
-    if walk_request(var s, var out) != snmperr.SNMP_OK
-        s.phase = SNMP_PHASE_IDLE
-        return failure(SNMP_FAIL_REPORT)
-    SnmpStep { action: SNMP_ACT_SEND, deliver: n > 0, count: n, done: false, failed: false,
-               reason: SNMP_FAIL_NONE, status: 0, index: 0, report: 0, ignored: false }
+    let sent = walk_request(var s, var out) == snmperr.SNMP_OK
+    s.phase = if sent
+        SNMP_PHASE_WAITING
+    else
+        SNMP_PHASE_IDLE
+    SnmpStep { action: (if sent then SNMP_ACT_SEND else SNMP_ACT_NONE), deliver: n > 0, count: n, done: false,
+               failed: not sent, reason: (if sent then SNMP_FAIL_NONE else SNMP_FAIL_REPORT), status: 0, index: 0,
+               report: 0, ignored: false }
 
 // Read a datagram that arrived.
 //
@@ -690,10 +705,14 @@ fn walk_answer(var s: SnmpSession, var r: SnmpPdu, var out: SnmpBuf) -> SnmpStep
 // ```
 pub @tier(embedded)
 @no_alloc
-fn on_datagram(var s: SnmpSession, var inb: SnmpBuf, var r: SnmpPdu, var out: SnmpBuf) -> SnmpStep []
+fn on_datagram(var s: SnmpSession, var inb: SnmpBuf, var r: SnmpPdu,
+               var out: SnmpBuf) -> SnmpStep []
     if s.phase != SNMP_PHASE_WAITING
         return ignored()
-    let c = if s.version == snmppdu.SNMP_V3 then receive_v3(var s, var inb, var r) else receive_community(var s, var inb, var r)
+    let c = if s.version == snmppdu.SNMP_V3
+        receive_v3(var s, var inb, var r)
+    else
+        receive_community(var s, var inb, var r)
     if c == snmperr.SNMP_E_NOT_IN_TIME_WINDOW
         s.phase = SNMP_PHASE_IDLE
         return failure(SNMP_FAIL_TIME_WINDOW)

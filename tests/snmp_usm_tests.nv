@@ -1,0 +1,387 @@
+// snmp_usm_tests.nv — the User-based Security Model: key localisation, the
+// digests, DES and AES, and a message protected and opened again.
+//
+// THE VECTORS.  The key-localisation values of RFC 3414 appendix A.3.1
+// (MD5) and A.3.2 (SHA-1) are the RFC's own, with the intermediate key.
+// The SHA-2 keys, the digests of the five protocols, and the AES block
+// are not in an RFC for this protocol: they were computed with Python's
+// `hashlib`, `hmac` and `cryptography` (OpenSSL), which share no code with
+// this package, and the comment above each says what was computed.  The DES
+// vectors are FIPS 81's, the AES vector is NIST SP 800-38A F.3.13.
+
+use std.bytes
+use std.test
+use snmpber
+use snmpdes
+use snmpoid
+use snmperr
+use snmppdu
+use snmpsession
+use snmpusm
+use snmpv3
+
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn hexof(b: Bytes) -> Str
+    bytes.to_hex(b)
+
+fn engine() -> Bytes
+    hex("000000000000000000000002")
+
+@test
+fn test_key_localisation_of_rfc_3414_appendix_a_3() [io]
+    // A.3.1: password "maplesyrup", engine ID 00 00 00 00 00 00 00 00 00 00
+    // 00 02.  The intermediate key is 9f af 32 83 88 4e 92 83 4e bc 98 47 d8
+    // ed d9 63, the localised key 52 6f 5e ed 9f cc e2 6f 89 64 c2 93 07 87
+    // d8 2b.
+    test.case("MD5")
+    let ku = snmpusm.password_to_key(snmpusm.USM_AUTH_MD5, "maplesyrup")
+    test.assert_eq(hexof(ku), "9faf3283884e92834ebc9847d8edd963")
+    test.assert_eq(hexof(snmpusm.localize_key(snmpusm.USM_AUTH_MD5, ku, engine())),
+        "526f5eed9fcce26f8964c2930787d82b")
+    // A.3.2: the intermediate key is 9f b5 cc 03 81 49 7b 37 93 52 89 39 ff
+    // 78 8d 5d 79 14 52 11, the localised key 66 95 fe bc 92 88 e3 62 82 23
+    // 5f c7 15 1f 12 84 97 b3 8f 3f.
+    test.case("SHA-1")
+    let ku1 = snmpusm.password_to_key(snmpusm.USM_AUTH_SHA1, "maplesyrup")
+    test.assert_eq(hexof(ku1), "9fb5cc0381497b3793528939ff788d5d79145211")
+    test.assert_eq(hexof(snmpusm.localize_key(snmpusm.USM_AUTH_SHA1, ku1, engine())),
+                   "6695febc9288e36282235fc7151f128497b38f3f")
+    test.case("the two steps in one")
+    test.assert_eq(hexof(snmpusm.localized_key(snmpusm.USM_AUTH_SHA1, "maplesyrup", engine())),
+                   "6695febc9288e36282235fc7151f128497b38f3f")
+
+@test
+fn test_key_localisation_with_the_sha_2_hashes_of_rfc_7860() [io]
+    // RFC 7860 section 4.2.1 says to use the algorithm of RFC 3414 appendix
+    // A.2 with the hash replaced.  These were computed with Python's
+    // hashlib over the same 1,048,576-octet stream and the same engine ID.
+    test.case("SHA-256")
+    let k256 = snmpusm.password_to_key(snmpusm.USM_AUTH_SHA256, "maplesyrup")
+    test.assert_eq(hexof(k256), "ab51014d1e077f6017df2b12bee5f5aa72993177e9bb569c4dff5a4ca0b4afac")
+    test.assert_eq(hexof(snmpusm.localize_key(snmpusm.USM_AUTH_SHA256, k256, engine())),
+                   "8982e0e549e866db361a6b625d84cccc11162d453ee8ce3a6445c2d6776f0f8b")
+    test.case("SHA-384")
+    test.assert_eq(hexof(snmpusm.localized_key(snmpusm.USM_AUTH_SHA384, "maplesyrup", engine())),
+                   "3b298f16164a11184279d5432bf169e2d2a48307de02b3d3f7e2b4f36eb6f0455a53689a3937eea07319a633d2ccba78")
+    test.case("SHA-512")
+    test.assert_eq(hexof(snmpusm.localized_key(snmpusm.USM_AUTH_SHA512, "maplesyrup", engine())),
+                   "22a5a36cedfcc085807a128d7bc6c2382167ad6c0dbc5fdff856740f3d84c099ad1ea87a8db096714d9788bd544047c9021e4229ce27e4c0a69250adfcffbb0b")
+
+@test
+fn test_the_digests_of_the_five_protocols() [io]
+    // The message is 30 41 02 01 03 followed by thirty 'x'.  Each digest is
+    // the HMAC of it under the localised key of "maplesyrup" at the engine
+    // above, cut to the protocol's length, computed with Python's hmac.
+    let msg = hex("3041020103787878787878787878787878787878787878787878787878787878787878")
+    test.case("HMAC-MD5-96")
+    let k5 = snmpusm.localized_key(snmpusm.USM_AUTH_MD5, "maplesyrup", engine())
+    test.assert_eq(hexof(snmpusm.digest_of(snmpusm.USM_AUTH_MD5, k5, msg)), "612834b0aaaddbe6be8e9887")
+    test.case("HMAC-SHA-96")
+    let k1 = snmpusm.localized_key(snmpusm.USM_AUTH_SHA1, "maplesyrup", engine())
+    test.assert_eq(hexof(snmpusm.digest_of(snmpusm.USM_AUTH_SHA1, k1, msg)), "95bbbe484396af1b525c5ec9")
+    test.case("the SHA-2 variants of RFC 7860: 24, 32 and 48 octets")
+    let k256 = snmpusm.localized_key(snmpusm.USM_AUTH_SHA256, "maplesyrup", engine())
+    test.assert_eq(hexof(snmpusm.digest_of(snmpusm.USM_AUTH_SHA256, k256, msg)),
+        "45cd77621b5a3071f2e7eba06cdbf9a10834224307d3de7c")
+    let k384 = snmpusm.localized_key(snmpusm.USM_AUTH_SHA384, "maplesyrup", engine())
+    test.assert_eq(hexof(snmpusm.digest_of(snmpusm.USM_AUTH_SHA384, k384, msg)),
+                   "5ca89dfa12cca4d065d8b4368adcb961c10c913585ea1c4a1b0314a6303acd1b")
+    let k512 = snmpusm.localized_key(snmpusm.USM_AUTH_SHA512, "maplesyrup", engine())
+    test.assert_eq(hexof(snmpusm.digest_of(snmpusm.USM_AUTH_SHA512, k512, msg)),
+                   "a1112f2463baf0ca6de521373df4e4c45f4f371178248f7d35027cf4dfac546335a4201f2a8e8e54d4b0ff444e4f77ce")
+
+@test
+fn test_lengths_and_unknown_protocols() [io]
+    test.assert_eq(snmpusm.auth_key_len(snmpusm.USM_AUTH_MD5), 16)
+    test.assert_eq(snmpusm.auth_key_len(snmpusm.USM_AUTH_SHA1), 20)
+    test.assert_eq(snmpusm.auth_key_len(snmpusm.USM_AUTH_SHA256), 32)
+    test.assert_eq(snmpusm.auth_key_len(snmpusm.USM_AUTH_SHA384), 48)
+    test.assert_eq(snmpusm.auth_key_len(snmpusm.USM_AUTH_SHA512), 64)
+    test.assert_eq(snmpusm.auth_key_len(3), 0)
+    test.assert_eq(snmpusm.auth_params_len(snmpusm.USM_AUTH_MD5), 12)
+    test.assert_eq(snmpusm.auth_params_len(snmpusm.USM_AUTH_SHA1), 12)
+    test.assert_eq(snmpusm.auth_params_len(snmpusm.USM_AUTH_SHA256), 24)
+    test.assert_eq(snmpusm.auth_params_len(snmpusm.USM_AUTH_SHA384), 32)
+    test.assert_eq(snmpusm.auth_params_len(snmpusm.USM_AUTH_SHA512), 48)
+    test.assert_eq(snmpusm.auth_params_len(0), 0)
+    test.case("a key from nothing")
+    test.assert_eq(bytes.len(snmpusm.password_to_key(3, "maplesyrup")), 0)
+    test.assert_eq(bytes.len(snmpusm.password_to_key(snmpusm.USM_AUTH_MD5, "")), 0)
+    test.assert_eq(bytes.len(snmpusm.localized_key(snmpusm.USM_AUTH_MD5, "", engine())), 0)
+    test.case("the salt")
+    test.assert_eq(hexof(snmpusm.salt_of(snmpusm.USM_PRIV_DES, 5, 258)), "0000000500000102")
+    test.assert_eq(hexof(snmpusm.salt_of(snmpusm.USM_PRIV_AES128, 5, 258)), "0000000000000102")
+    test.case("a password longer than the stream chunk")
+    test.assert_eq(bytes.len(snmpusm.password_to_key(snmpusm.USM_AUTH_MD5, "0123456789012345678901234567890123456789012345678901234567890123456789")),
+        16)
+
+@test
+fn test_a_user_and_its_keys() [io]
+    let u = snmpusm.usm_user(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_AES128, "maplesyrup", "newsyrup", engine())
+    test.assert_eq(u.auth, snmpusm.USM_AUTH_SHA1)
+    test.assert_eq(u.priv, snmpusm.USM_PRIV_AES128)
+    test.assert_eq(bytes.len(u.auth_key), 20)
+    test.assert_eq(bytes.len(u.priv_key), 16)
+    // RFC 3414 appendix A.5.2: the localised key of "newsyrup" under SHA is
+    // 78 e2 dc ce 79 d5 94 03 b5 8c 1b ba a5 bf f4 63 91 f1 cd 25 and "for
+    // DES it gets truncated to 16 octets".
+    test.assert_eq(hexof(u.priv_key), "78e2dcce79d59403b58c1bbaa5bff463")
+    test.case("no privacy without authentication")
+    let v = snmpusm.usm_user(snmpusm.USM_AUTH_NONE, snmpusm.USM_PRIV_DES, "", "newsyrup", engine())
+    test.assert_eq(v.priv, snmpusm.USM_PRIV_NONE)
+    test.assert_eq(bytes.len(v.priv_key), 0)
+    test.case("no privacy protocol")
+    let w = snmpusm.usm_user(snmpusm.USM_AUTH_MD5, snmpusm.USM_PRIV_NONE, "maplesyrup", "", engine())
+    test.assert_eq(bytes.len(w.priv_key), 0)
+    test.assert_eq(bytes.len(w.auth_key), 16)
+
+@test
+fn test_des_known_answers_of_fips_81() [io]
+    // FIPS 81 appendix: the key 133457799BBCDFF1 encrypts 0123456789ABCDEF to
+    // 85E813540F0AB405.  The others are the single-bit tests of the NBS
+    // validation set and the weak-key case, computed with OpenSSL.
+    test.case("one block")
+    test.assert_eq(hexof(snmpdes.encrypt_block(hex("133457799BBCDFF1"), hex("0123456789ABCDEF")) ?? bytes.zeros(0)),
+                   "85e813540f0ab405")
+    test.assert_eq(hexof(snmpdes.encrypt_block(hex("0101010101010101"), hex("8000000000000000")) ?? bytes.zeros(0)),
+                   "95f8a5e5dd31d900")
+    test.assert_eq(hexof(snmpdes.encrypt_block(hex("FEFEFEFEFEFEFEFE"), hex("FFFFFFFFFFFFFFFF")) ?? bytes.zeros(0)),
+                   "7359b2163e4edc58")
+    test.assert_eq(hexof(snmpdes.decrypt_block(hex("133457799BBCDFF1"), hex("85E813540F0AB405")) ?? bytes.zeros(0)),
+                   "0123456789abcdef")
+    // FIPS 81 appendix: CBC with key 0123456789abcdef, IV 1234567890abcdef
+    // and the text "Now is the time for all ".
+    test.case("cipher block chaining")
+    let c = snmpdes.cbc_encrypt(hex("0123456789abcdef"), hex("1234567890abcdef"), bytes.from_str("Now is the time for all ")) ?? bytes.zeros(0)
+    test.assert_eq(hexof(c), "e5c7cdde872bf27c43e934008c389c0f683788499a7c05f6")
+    let p = snmpdes.cbc_decrypt(hex("0123456789abcdef"), hex("1234567890abcdef"), c) ?? bytes.zeros(0)
+    test.assert_eq(bytes.to_str(p), "Now is the time for all ")
+    test.case("data that is not a multiple of 8 is padded with zeros")
+    let c2 = snmpdes.cbc_encrypt(hex("0123456789abcdef"), hex("1234567890abcdef"), bytes.from_str("abc")) ?? bytes.zeros(0)
+    test.assert_eq(bytes.len(c2), 8)
+    let p2 = snmpdes.cbc_decrypt(hex("0123456789abcdef"), hex("1234567890abcdef"), c2) ?? bytes.zeros(0)
+    test.assert_eq(hexof(p2), "6162630000000000")
+    test.case("empty data")
+    test.assert_eq(bytes.len(snmpdes.cbc_encrypt(hex("0123456789abcdef"), hex("1234567890abcdef"), bytes.zeros(0)) ?? bytes.zeros(1)),
+        0)
+    test.case("keys, vectors and data of the wrong length")
+    test.assert(snmpdes.encrypt_block(hex("0123"), hex("0123456789ABCDEF")) == None)
+    test.assert(snmpdes.encrypt_block(hex("133457799BBCDFF1"), hex("0123")) == None)
+    test.assert(snmpdes.decrypt_block(hex("0123"), hex("0123456789ABCDEF")) == None)
+    test.assert(snmpdes.decrypt_block(hex("133457799BBCDFF1"), hex("0123")) == None)
+    test.assert(snmpdes.cbc_encrypt(hex("0123"), hex("1234567890abcdef"), hex("00")) == None)
+    test.assert(snmpdes.cbc_encrypt(hex("0123456789abcdef"), hex("12"), hex("00")) == None)
+    test.assert(snmpdes.cbc_decrypt(hex("0123"), hex("1234567890abcdef"), hex("0000000000000000")) == None)
+    test.assert(snmpdes.cbc_decrypt(hex("0123456789abcdef"), hex("12"), hex("0000000000000000")) == None)
+    test.assert(snmpdes.cbc_decrypt(hex("0123456789abcdef"), hex("1234567890abcdef"), hex("00")) == None)
+
+@test
+fn test_aes_cfb_of_rfc_3826() [io]
+    // NIST SP 800-38A F.3.13, CFB128-AES128: two blocks of plaintext
+    // 6bc1bee22e409f96e93d7e117393172a ae2d8a571e03ac9c9eb76fac45af8e51 under
+    // the key 2b7e151628aed2a6abf7158809cf4f3c and the initialisation vector
+    // 000102030405060708090a0b0c0d0e0f.  RFC 3826's IV is boots, time and salt,
+    // 16 octets, so the vector is expressed as boots 0x00010203, time
+    // 0x04050607 and salt 08 09 0a 0b 0c 0d 0e 0f.
+    let key = hex("2b7e151628aed2a6abf7158809cf4f3c")
+    let salt = hex("08090a0b0c0d0e0f")
+    let plain = hex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+    let c = snmpusm.encrypt(snmpusm.USM_PRIV_AES128, key, 66051, 67438087, salt, plain) ?? bytes.zeros(0)
+    test.assert_eq(hexof(c), "3b3fd92eb72dad20333449f8e83cfb4ac8a64537a0b3a93fcde3cdad9f1ce58b")
+    test.assert_eq(hexof(snmpusm.decrypt(snmpusm.USM_PRIV_AES128, key, 66051, 67438087, salt, c) ?? bytes.zeros(0)),
+                   hexof(plain))
+    test.case("a message that is not a whole number of blocks keeps its length")
+    let p21 = bytes.from_str("hello world, 21 bytes!")
+    let c21 = snmpusm.encrypt(snmpusm.USM_PRIV_AES128, key, 66051, 67438087, salt, p21) ?? bytes.zeros(0)
+    test.assert_eq(hexof(c21), "389b0ba0f64d45d9a86553c5bb9ddd408d66ecb22382")
+    test.assert_eq(bytes.to_str(snmpusm.decrypt(snmpusm.USM_PRIV_AES128, key, 66051, 67438087, salt, c21) ?? bytes.zeros(0)),
+                   "hello world, 21 bytes!")
+    test.case("DES through the same functions")
+    let dk = hex("0123456789abcdef0011223344556677")
+    let dsalt = snmpusm.salt_of(snmpusm.USM_PRIV_DES, 1, 1)
+    let dc = snmpusm.encrypt(snmpusm.USM_PRIV_DES, dk, 1, 2, dsalt, bytes.from_str("scoped PDU")) ?? bytes.zeros(0)
+    test.assert_eq(bytes.len(dc), 16)
+    test.assert_eq(hexof(snmpusm.decrypt(snmpusm.USM_PRIV_DES, dk, 1, 2, dsalt, dc) ?? bytes.zeros(0)),
+                   "73636f70656420504455000000000000")
+    test.case("a key or salt of the wrong length, an unknown protocol")
+    test.assert(snmpusm.encrypt(snmpusm.USM_PRIV_AES128, hex("00"), 0, 0, salt, plain) == None)
+    test.assert(snmpusm.encrypt(snmpusm.USM_PRIV_AES128, key, 0, 0, hex("00"), plain) == None)
+    test.assert(snmpusm.encrypt(snmpusm.USM_PRIV_DES, hex("00"), 0, 0, salt, plain) == None)
+    test.assert(snmpusm.decrypt(snmpusm.USM_PRIV_DES, hex("00"), 0, 0, salt, plain) == None)
+    test.assert(snmpusm.encrypt(9, key, 0, 0, salt, plain) == None)
+    test.assert(snmpusm.decrypt(snmpusm.USM_PRIV_AES128, hex("00"), 0, 0, salt, plain) == None)
+    test.assert(snmpusm.decrypt(9, key, 0, 0, salt, plain) == None)
+
+// A request a v3 session built at the given level, for the engine "engine".
+fn message_at(level: Int, auth_len: Int) -> snmpber.SnmpBuf
+    var s = snmpsession.session_v3("bert", level, auth_len, 100)
+    var id: snmpber.SnmpName = Vec.new()
+    let _a = snmpber.name_set(var id, "engine")
+    snmpsession.engine_known(var s, var id, 3, 1000)
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 0)
+    var o = snmpoid_of("1.3.6.1.2.1.1.1.0")
+    let _b = snmppdu.add_null(var p, var o)
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    let _c = snmpsession.request(var s, var p, var pool, var out)
+    out
+
+fn snmpoid_of(text: Str) -> SnmpOid
+    var o = snmpoid.oid_empty()
+    let _ok = snmpoid.oid_parse(var o, text)
+    o
+
+fn user_for(auth: Int, priv: Int) -> UsmUser
+    snmpusm.usm_user(auth, priv, "authpassword", "privpassword", bytes.from_str("engine"))
+
+// The scoped PDU of a plaintext message, as bytes.
+fn scoped_bytes(var m: snmpber.SnmpBuf) -> Str
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    let _c = snmpv3.v3_decode(var m, var h, var u, var lay)
+    var xs: [Int] = []
+    for i in lay.data_off..m.len()
+        list.push(xs, m[i] as Int)
+    bytes.to_hex(bytes.from_byte_list(xs))
+
+@test
+fn test_every_security_level_round_trips() [io]
+    for pair in [[snmpusm.USM_AUTH_MD5, snmpusm.USM_PRIV_NONE], [snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_NONE],
+                 [snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_DES], [snmpusm.USM_AUTH_SHA256, snmpusm.USM_PRIV_AES128],
+                 [snmpusm.USM_AUTH_SHA384, snmpusm.USM_PRIV_DES], [snmpusm.USM_AUTH_SHA512, snmpusm.USM_PRIV_AES128]]
+        let user = user_for(pair[0], pair[1])
+        let level = snmpv3.SNMP_FLAG_AUTH | (if pair[1] == snmpusm.USM_PRIV_NONE then 0 else snmpv3.SNMP_FLAG_PRIV)
+        var m = message_at(level & 1, snmpusm.auth_params_len(pair[0]))
+        let clear = scoped_bytes(var m)
+        test.assert_eq(snmpusm.protect(var m, user, 77), snmperr.SNMP_OK)
+        var h = snmpv3.header_empty()
+        var u = snmpv3.usm_empty()
+        var lay = snmpv3.layout_empty()
+        test.assert_eq(snmpv3.v3_decode(var m, var h, var u, var lay), snmperr.SNMP_OK)
+        test.assert_eq(h.flags, level | snmpv3.SNMP_FLAG_REPORTABLE)
+        test.assert_eq(lay.encrypted, pair[1] != snmpusm.USM_PRIV_NONE)
+        test.assert(snmpusm.verify(var m, user))
+        test.assert_eq(snmpusm.unprotect(var m, user), snmperr.SNMP_OK)
+        test.assert_eq(scoped_bytes(var m), clear)
+
+@test
+fn test_a_message_that_is_changed_fails_its_digest() [io]
+    let user = user_for(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_NONE)
+    var m = message_at(snmpv3.SNMP_FLAG_AUTH, 12)
+    test.assert_eq(snmpusm.protect(var m, user, 1), snmperr.SNMP_OK)
+    test.case("one flipped bit in the PDU")
+    var bad = m
+    bad[bad.len() - 1] = (bad[bad.len() - 1] as Int ^ 1) as u8
+    test.assert(not snmpusm.verify(var bad, user))
+    test.assert_eq(snmpusm.unprotect(var bad, user), snmperr.SNMP_E_WRONG_DIGEST)
+    test.case("another key")
+    let other = snmpusm.usm_user(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_NONE, "otherpassword", "", bytes.from_str("engine"))
+    test.assert(not snmpusm.verify(var m, other))
+    test.case("a message with a digest of the wrong length")
+    let md5 = user_for(snmpusm.USM_AUTH_SHA256, snmpusm.USM_PRIV_NONE)
+    test.assert(not snmpusm.verify(var m, md5))
+    test.case("a message that is not a v3 message")
+    var junk: snmpber.SnmpBuf = Vec.new()
+    test.assert(not snmpusm.verify(var junk, user))
+    test.assert_eq(snmpusm.unprotect(var junk, user), snmperr.SNMP_E_TRUNCATED)
+    test.assert_eq(snmpusm.protect(var junk, user, 1), snmperr.SNMP_E_TRUNCATED)
+    test.case("a user with an authentication protocol and no key")
+    let keyless = snmpusm.usm_user(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_NONE, "", "", bytes.from_str("engine"))
+    test.assert(not snmpusm.verify(var m, keyless))
+    var n = message_at(snmpv3.SNMP_FLAG_AUTH, 12)
+    test.assert_eq(snmpusm.protect(var n, keyless, 1), snmperr.SNMP_E_BAD_ARGUMENT)
+
+@test
+fn test_security_levels_that_disagree() [io]
+    test.case("protect: no authentication and no privacy leaves the message as it is")
+    var plain = message_at(0, 0)
+    let same = scoped_bytes(var plain)
+    test.assert_eq(snmpusm.protect(var plain, user_for(snmpusm.USM_AUTH_NONE, snmpusm.USM_PRIV_NONE), 1),
+        snmperr.SNMP_OK)
+    test.assert_eq(scoped_bytes(var plain), same)
+    test.case("protect: the message asks for authentication and the user has none")
+    let none = user_for(snmpusm.USM_AUTH_NONE, snmpusm.USM_PRIV_NONE)
+    var a = message_at(snmpv3.SNMP_FLAG_AUTH, 12)
+    test.assert_eq(snmpusm.protect(var a, none, 1), snmperr.SNMP_E_BAD_FLAGS)
+    test.case("protect: the user has authentication and the message does not ask for it")
+    let sha = user_for(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_NONE)
+    var b = message_at(0, 0)
+    test.assert_eq(snmpusm.protect(var b, sha, 1), snmperr.SNMP_E_BAD_FLAGS)
+    test.case("protect: a message already encrypted")
+    let priv = user_for(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_AES128)
+    var c = message_at(snmpv3.SNMP_FLAG_AUTH, 12)
+    test.assert_eq(snmpusm.protect(var c, priv, 1), snmperr.SNMP_OK)
+    test.assert_eq(snmpusm.protect(var c, priv, 2), snmperr.SNMP_E_BAD_FLAGS)
+    test.case("protect: authentication parameters of the wrong length")
+    var d = message_at(snmpv3.SNMP_FLAG_AUTH, 16)
+    test.assert_eq(snmpusm.protect(var d, sha, 1), snmperr.SNMP_E_BAD_ARGUMENT)
+    test.case("protect: privacy with a key of the wrong length")
+    let broken = UsmUser { auth: snmpusm.USM_AUTH_SHA1,
+        priv: snmpusm.USM_PRIV_AES128,
+        auth_key: sha.auth_key,
+        priv_key: hex("00") }
+    var e = message_at(snmpv3.SNMP_FLAG_AUTH, 12)
+    test.assert_eq(snmpusm.protect(var e, broken, 1), snmperr.SNMP_E_BAD_ARGUMENT)
+    test.case("unprotect: the message has a level the user does not")
+    var f = message_at(snmpv3.SNMP_FLAG_AUTH, 12)
+    test.assert_eq(snmpusm.protect(var f, sha, 1), snmperr.SNMP_OK)
+    test.assert_eq(snmpusm.unprotect(var f, none), snmperr.SNMP_E_BAD_FLAGS)
+    var g = message_at(snmpv3.SNMP_FLAG_AUTH, 12)
+    test.assert_eq(snmpusm.protect(var g, priv, 1), snmperr.SNMP_OK)
+    test.assert_eq(snmpusm.unprotect(var g, sha), snmperr.SNMP_E_BAD_FLAGS)
+
+@test
+fn test_decryption_with_the_wrong_key_is_not_a_scoped_pdu() [io]
+    let priv = user_for(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_AES128)
+    var m = message_at(snmpv3.SNMP_FLAG_AUTH, 12)
+    test.assert_eq(snmpusm.protect(var m, priv, 1), snmperr.SNMP_OK)
+    // The same authentication key and another privacy key: the digest is
+    // right and the plaintext is not.
+    let wrong = UsmUser { auth: priv.auth,
+        priv: priv.priv,
+        auth_key: priv.auth_key,
+        priv_key: hex("00112233445566778899aabbccddeeff") }
+    test.assert_eq(snmpusm.unprotect(var m, wrong), snmperr.SNMP_E_DECRYPT)
+    test.case("a message with privacy parameters that are not 8 octets")
+    var h = SnmpV3Header { msg_id: 1, max_size: 1472, flags: 7, model: 3 }
+    var u = snmpv3.usm_empty()
+    let _x = snmpber.name_set(var u.engine_id, "engine")
+    let _y = snmpber.name_set(var u.user, "bert")
+    var short = SnmpUsm { engine_id: u.engine_id,
+        boots: 1,
+        time: 1,
+        user: u.user,
+        auth_params: zeros12(),
+        priv_params: short_salt() }
+    var data: snmpber.SnmpBuf = Vec.new()
+    for i in 0..16
+        let _z = snmpber.put_byte(var data, i)
+    var out: snmpber.SnmpBuf = Vec.new()
+    var lay = snmpv3.layout_empty()
+    test.assert_eq(snmpv3.v3_encode(var out, h, var short, var data, true, var lay), snmperr.SNMP_OK)
+    let d = snmpusm.digest_of(priv.auth, priv.auth_key, zeroed_copy(var out, lay))
+    for i in 0..12
+        out[lay.auth_off + i] = (bytes.byte_at(d, i) ?? 0) as u8
+    test.assert_eq(snmpusm.unprotect(var out, priv), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+
+fn zeros12() -> Vec[u8; 48]
+    var v: Vec[u8; 48] = Vec.new()
+    for _i in 0..12
+        let _ok = v.push(0)
+    v
+
+fn short_salt() -> Vec[u8; 8]
+    var v: Vec[u8; 8] = Vec.new()
+    for i in 0..4
+        let _ok = v.push(i as u8)
+    v
+
+fn zeroed_copy(var m: snmpber.SnmpBuf, lay: SnmpV3Layout) -> Bytes
+    var xs: [Int] = []
+    for i in 0..m.len()
+        let inside = i >= lay.auth_off and i < lay.auth_off + lay.auth_len
+        list.push(xs, (if inside then 0 else m[i] as Int))
+    bytes.from_byte_list(xs)

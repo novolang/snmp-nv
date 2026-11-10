@@ -1,0 +1,206 @@
+// tests/embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS AN SNMP MANAGER ON A MICROCONTROLLER: a gateway or a
+// sensor hub that polls the switches and UPSes on its network, walks a
+// subtree to find the interfaces, sets a value and sends a trap when a
+// reading crosses a limit, with no heap.  Everything it decides is here:
+// build a request, read the answer, match it to the request in flight,
+// ask again for the next name of a walk, and read the message that
+// starts engine discovery.  The probe is that, compiled for the hardware,
+// with the agent played by a function in the same program, so a single
+// image runs the whole exchange with no network.
+//
+// Six checks run, and the score counts what held.  The buffers are a few
+// datagrams of 1472 bytes and a PDU of eight bindings, all in the frame;
+// nothing is allocated.  The modules that do the User-based Security
+// Model's cryptography (`snmpusm`, `snmpdes`, `snmptext`) are not part of
+// the claim; they take `Bytes`, which the embedded runtime does not
+// define.
+
+use std.str
+use snmpber
+use snmperr
+use snmpoid
+use snmppdu
+use snmpsession
+use snmpv3
+
+// The name of entry `n` of the agent's table: 1.3.6.1.2.1.1.n.0.
+@tier(embedded)
+@no_alloc
+fn entry(var o: SnmpOid, n: Int) []
+    o.arcs.clear()
+    let _a = snmpoid.oid_push(var o, 1)
+    let _b = snmpoid.oid_push(var o, 3)
+    let _c = snmpoid.oid_push(var o, 6)
+    let _d = snmpoid.oid_push(var o, 1)
+    let _e = snmpoid.oid_push(var o, 2)
+    let _f = snmpoid.oid_push(var o, 1)
+    let _g = snmpoid.oid_push(var o, 1)
+    let _h = snmpoid.oid_push(var o, n)
+    let _i = snmpoid.oid_push(var o, 0)
+
+// The agent: answer a Get with the same name, a GetNext with the next entry
+// of a table of three objects, and a GetNext past them with a name outside
+// the subtree.
+@tier(embedded)
+@no_alloc
+fn agent(var req: SnmpBuf, var out: SnmpBuf) []
+    var info = snmppdu.info_new()
+    let _a = snmppdu.msg_decode(var req, var info)
+    var q = snmppdu.pdu_new(0, 0)
+    let _b = snmppdu.pdu_decode(var req, info.pdu_off, info.pdu_end, var q)
+    var r = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, q.request_id)
+    let have = snmpoid.oid_len(var q.vbs[0].oid)
+    let n = if have >= 8
+        snmpoid.oid_arc(var q.vbs[0].oid, 7)
+    else
+        0
+    var name = snmpoid.oid_empty()
+    if q.tag == snmppdu.SNMP_PDU_GET
+        entry(var name, n)
+    elif n < 3
+        entry(var name, n + 1)
+    else
+        let _x = snmpoid.oid_parse(var name, "1.3.6.1.2.1.2.1.0")
+    let _c = snmppdu.add_integer(var r, var name, 40 + n)
+    var pool: SnmpBuf = Vec.new()
+    out.clear()
+    let _d = snmppdu.msg_encode(var out, info.version, "public", var r, var pool)
+
+// A GET and its answer: 1 when the value comes back.
+@tier(embedded)
+@no_alloc
+fn get_check() -> Int []
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 100)
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 0)
+    var o = snmpoid.oid_empty()
+    entry(var o, 1)
+    let _a = snmppdu.add_null(var p, var o)
+    var pool: SnmpBuf = Vec.new()
+    var req: SnmpBuf = Vec.new()
+    var rsp: SnmpBuf = Vec.new()
+    var r = snmppdu.pdu_new(0, 0)
+    var spare: SnmpBuf = Vec.new()
+    if snmpsession.request(var s, var p, var pool, var req) != snmperr.SNMP_OK or req.len() != 40
+        return 0
+    agent(var req, var rsp)
+    let st = snmpsession.on_datagram(var s, var rsp, var r, var spare)
+    if st.done and st.deliver and r.vbs[0].num == 41
+        return 1
+    0
+
+// A walk of three objects with GetNext: 1 when all three arrive in order
+// and the walk ends by itself.
+@tier(embedded)
+@no_alloc
+fn walk_check() -> Int []
+    var s = snmpsession.session_new(snmppdu.SNMP_V1, "public", 7)
+    var root = snmpoid.oid_empty()
+    let _a = snmpoid.oid_parse(var root, "1.3.6.1.2.1.1")
+    var req: SnmpBuf = Vec.new()
+    var rsp: SnmpBuf = Vec.new()
+    var r = snmppdu.pdu_new(0, 0)
+    if snmpsession.walk(var s, var root, var req) != snmperr.SNMP_OK
+        return 0
+    var got = 0
+    var last = 0
+    var ended = false
+    for _i in 0..6
+        if not ended
+            agent(var req, var rsp)
+            let st = snmpsession.on_datagram(var s, var rsp, var r, var req)
+            if st.deliver
+                got = got + st.count
+                last = r.vbs[0].num
+            ended = st.done
+    if got == 3 and last == 42 and ended
+        return 1
+    0
+
+// A retry and a timeout: 1 when the second wait asks for the same
+// datagram again and the third fails.
+@tier(embedded)
+@no_alloc
+fn retry_check() -> Int []
+    var s = snmpsession.session_new(snmppdu.SNMP_V2C, "public", 1)
+    snmpsession.set_limits(var s, 100, 3)
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 0)
+    var pool: SnmpBuf = Vec.new()
+    var req: SnmpBuf = Vec.new()
+    if snmpsession.request(var s, var p, var pool, var req) != snmperr.SNMP_OK
+        return 0
+    let a = snmpsession.tick(var s, 100)
+    let b = snmpsession.tick(var s, 100)
+    let c = snmpsession.tick(var s, 100)
+    if a.action == snmpsession.SNMP_ACT_RESEND and b.action == snmpsession.SNMP_ACT_RESEND and c.failed
+        return 1
+    0
+
+// A v1 trap and its reading: 1 when the numbers come back.
+@tier(embedded)
+@no_alloc
+fn trap_check() -> Int []
+    var e = snmpoid.oid_empty()
+    let _a = snmpoid.oid_parse(var e, "1.3.6.1.4.1.9")
+    var t = snmppdu.trap1_new(var e, 167772161, 6, 1, 100)
+    var out: SnmpBuf = Vec.new()
+    var pool: SnmpBuf = Vec.new()
+    if not snmppdu.trap1_encode(var out, "public", var t, var pool) or out.len() != 40
+        return 0
+    var info = snmppdu.info_new()
+    var u = snmppdu.trap1_empty()
+    if snmppdu.msg_decode(var out, var info) != snmperr.SNMP_OK
+        return 0
+    if snmppdu.trap1_decode(var out, info, var u) == snmperr.SNMP_OK and u.generic == 6 and u.timestamp == 100
+        return 1
+    0
+
+// The message that starts SNMPv3 engine discovery, and the time window:
+// 1 when the message is 57 bytes and reads back.
+@tier(embedded)
+@no_alloc
+fn v3_check() -> Int []
+    var out: SnmpBuf = Vec.new()
+    if not snmpv3.discovery_request(var out, 1, 7) or out.len() != 57
+        return 0
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    if snmpv3.v3_decode(var out, var h, var u, var lay) != snmperr.SNMP_OK
+        return 0
+    if h.flags == snmpv3.SNMP_FLAG_REPORTABLE and snmpv3.in_window_authoritative(5, 1000, 5, 1100)
+        and not snmpv3.in_window_authoritative(5, 1000, 5, 1200)
+        return 1
+    0
+
+// The sentences of the error codes are in flash: 1 when one reads back.
+@tier(embedded)
+@no_alloc
+fn text_check() -> Int []
+    if str.len(snmperr.error_text(snmperr.SNMP_E_TRUNCATED)) > 0 and snmperr.error_status_name(2) == "noSuchName"
+        return 1
+    0
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.
+@tier(embedded)
+fn score() -> Int []
+    get_check() + walk_check() + retry_check() + trap_check() + v3_check() + text_check()
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 6 is the number of checks in `score`.  The count is printed on a
+    // failure rather than only compared, so a device that disagrees with
+    // the host says how many it lost.
+    let n = score()
+    if n == 6
+        hal.uart.write("PASS: snmp-embedded\n")
+    else
+        hal.uart.write("FAIL: snmp-embedded score=")
+        hal.uart.write(str.from_int(n))
+        hal.uart.write("\n")
+    loop
+        hal.timer.delay_ms(1000)

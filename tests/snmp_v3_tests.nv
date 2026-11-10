@@ -47,7 +47,12 @@ fn sample_usm() -> SnmpUsm
     var salt: Vec[u8; 8] = Vec.new()
     for x in [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
         let _c = salt.push(x as u8)
-    SnmpUsm { engine_id: id, boots: 1, time: 257, user: name_of("bert"), auth_params: auth, priv_params: salt }
+    SnmpUsm { engine_id: id,
+        boots: 1,
+        time: 257,
+        user: name_of("bert"),
+        auth_params: auth,
+        priv_params: salt }
 
 // An empty-GetRequest scoped PDU: 30 11 | 04 00 | 04 00 | A0 0B ...
 fn plain_scoped() -> snmpber.SnmpBuf
@@ -85,7 +90,8 @@ fn test_engine_discovery_request_byte_by_byte() [io]
                                   0x04, 0x10, 0x30, 0x0E, 0x04, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
                                   0x04, 0x00, 0x04, 0x00, 0x04, 0x00,
                                   0x30, 0x11, 0x04, 0x00, 0x04, 0x00, 0xA0, 0x0B, 0x02, 0x01, 0x07,
-                                  0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), -1)
+                                  0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]),
+                                  -1)
 
 @test
 fn test_the_usm_sample_byte_by_byte() [io]
@@ -106,7 +112,8 @@ fn test_the_usm_sample_byte_by_byte() [io]
                                   0x04, 0x0C, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98,
                                   0x04, 0x08, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
                                   0x30, 0x11, 0x04, 0x00, 0x04, 0x00, 0xA0, 0x0B, 0x02, 0x01, 0x07,
-                                  0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]), -1)
+                                  0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]),
+                                  -1)
     test.case("the layout points at the digest and at the data")
     var h = snmpv3.header_empty()
     var u = snmpv3.usm_empty()
@@ -167,10 +174,13 @@ fn test_a_header_that_cannot_be_written() [io]
     test.case("privacy without authentication, and flags that disagree with the data")
     out.clear()
     test.assert_eq(snmpv3.v3_encode(var out, header(2), var u, var data, true, var lay), snmperr.SNMP_E_BAD_FLAGS)
-    test.assert_eq(snmpv3.v3_encode(var out, header(3), var u, var data, false, var lay), snmperr.SNMP_E_BAD_FLAGS)
+    test.assert_eq(snmpv3.v3_encode(var out, header(3), var u, var data, false, var lay),
+        snmperr.SNMP_E_BAD_FLAGS)
     test.assert_eq(snmpv3.v3_encode(var out, header(1), var u, var data, true, var lay), snmperr.SNMP_E_BAD_FLAGS)
-    test.assert_eq(snmpv3.v3_encode(var out, header(256), var u, var data, false, var lay), snmperr.SNMP_E_BAD_FLAGS)
-    test.assert_eq(snmpv3.v3_encode(var out, header(-1), var u, var data, false, var lay), snmperr.SNMP_E_BAD_FLAGS)
+    test.assert_eq(snmpv3.v3_encode(var out, header(256), var u, var data, false, var lay),
+        snmperr.SNMP_E_BAD_FLAGS)
+    test.assert_eq(snmpv3.v3_encode(var out, header(-1), var u, var data, false, var lay),
+        snmperr.SNMP_E_BAD_FLAGS)
     test.case("a full buffer")
     for _i in 0..snmpber.SNMP_MSG_MAX
         let _ok = snmpber.put_byte(var out, 0)
@@ -226,7 +236,7 @@ fn test_messages_that_are_refused() [io]
     var m = patched(5, 66, 0x09)
     test.assert_eq(decode_code(var m), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
     test.case("boots and time that are not integers or are negative")
-    var n = patched(5, 39, 0x04)
+    var n = patched(5, 38, 0x04)
     test.assert_eq(decode_code(var n), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
     var o = patched(5, 42, 0x04)
     test.assert_eq(decode_code(var o), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
@@ -295,6 +305,16 @@ fn test_header_pieces_that_are_cut_short_or_wrong() [io]
     test.assert_eq(decode_code(var f), snmperr.SNMP_E_TRUNCATED)
     var g = with_global(list.concat(list.concat(id, size), list.concat(flags, [0x04, 0x01, 0x03])))
     test.assert_eq(decode_code(var g), snmperr.SNMP_E_BAD_TAG)
+    test.case("global data that is an octet string")
+    var k = buf_of([0x30, 0x05, 0x02, 0x01, 0x03, 0x04, 0x00])
+    test.assert_eq(decode_code(var k), snmperr.SNMP_E_BAD_TAG)
+    test.case("a message that ends after the security parameters")
+    var whole = patched(5, 2, 0x02)
+    var cut = buf_of([])
+    for i in 0..75
+        let _ok = snmpber.put_byte(var cut, whole[i] as Int)
+    cut[1] = 0x49
+    test.assert_eq(decode_code(var cut), snmperr.SNMP_E_TRUNCATED)
     test.case("an octet after the model")
     var h = with_global(list.concat(list.concat(id, size), list.concat(flags, list.concat(model, [0x05, 0x00]))))
     test.assert_eq(decode_code(var h), snmperr.SNMP_E_BAD_HEADER)
@@ -329,7 +349,8 @@ fn test_the_scoped_pdu() [io]
     var long = buf_of([0x30, 0x23, 0x04, 0x21])
     for _i in 0..33
         let _ok = snmpber.put_byte(var long, 0)
-    test.assert_eq(snmpv3.scoped_decode(var long, 0, long.len(), var sc2, var q), snmperr.SNMP_E_BAD_SECURITY_PARAMS)
+    test.assert_eq(snmpv3.scoped_decode(var long, 0, long.len(), var sc2, var q),
+        snmperr.SNMP_E_BAD_SECURITY_PARAMS)
     var noname = buf_of([0x30, 0x02, 0x04, 0x00])
     test.assert_eq(snmpv3.scoped_decode(var noname, 0, 4, var sc2, var q), snmperr.SNMP_E_TRUNCATED)
     var empty = buf_of([])
@@ -413,3 +434,11 @@ fn test_empty_constructors() [io]
     test.assert_eq(snmperr.error_text(999), "an unknown error code")
     test.assert_eq(snmperr.error_status_name(snmperr.SNMP_NOT_WRITABLE), "notWritable")
     test.assert_eq(snmperr.error_status_name(99), "unknown")
+
+@test
+fn test_every_error_has_a_sentence_and_every_status_a_name() [io]
+    for code in 0..22
+        test.assert(snmperr.error_text(code) != "an unknown error code")
+    test.assert_eq(snmperr.error_text(22), "an unknown error code")
+    for status in 0..19
+        test.assert(snmperr.error_status_name(status) != "unknown")

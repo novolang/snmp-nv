@@ -396,7 +396,7 @@ fn put_varbinds(var out: SnmpBuf, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
 //     let _y = snmppdu.add_null(var p, var o)
 //     var out: snmpber.SnmpBuf = Vec.new()
 //     var pool: snmpber.SnmpBuf = Vec.new()
-//     println("${snmppdu.pdu_encode(var out, var p, var pool)} ${out.len()}")   // true 29
+//     println("${snmppdu.pdu_encode(var out, var p, var pool)} ${out.len()}")   // true 27
 // ```
 pub @tier(embedded)
 @no_alloc
@@ -427,11 +427,12 @@ fn pdu_encode(var out: SnmpBuf, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
 //     let _y = snmppdu.add_null(var p, var o)
 //     var out: snmpber.SnmpBuf = Vec.new()
 //     var pool: snmpber.SnmpBuf = Vec.new()
-//     println("${snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "public", var p, var pool)} ${out.len()}")   // true 43
+//     println("${snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "public", var p, var pool)} ${out.len()}")   // true 40
 // ```
 pub @tier(embedded)
 @no_alloc
-fn msg_encode(var out: SnmpBuf, version: Int, community: Str, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
+fn msg_encode(var out: SnmpBuf, version: Int, community: Str, var p: SnmpPdu,
+              var pool: SnmpBuf) -> Bool []
     var name: SnmpName = Vec.new()
     snmpber.name_set(var name, community) and msg_encode_name(var out, version, var name, var p, var pool)
 
@@ -448,11 +449,12 @@ fn msg_encode(var out: SnmpBuf, version: Int, community: Str, var p: SnmpPdu, va
 //     let _x = snmpber.name_set(var n, "public")
 //     var out: snmpber.SnmpBuf = Vec.new()
 //     var pool: snmpber.SnmpBuf = Vec.new()
-//     println("${snmppdu.msg_encode_name(var out, snmppdu.SNMP_V2C, var n, var p, var pool)} ${out.len()}")   // true 28
+//     println("${snmppdu.msg_encode_name(var out, snmppdu.SNMP_V2C, var n, var p, var pool)} ${out.len()}")   // true 26
 // ```
 pub @tier(embedded)
 @no_alloc
-fn msg_encode_name(var out: SnmpBuf, version: Int, var community: SnmpName, var p: SnmpPdu, var pool: SnmpBuf) -> Bool []
+fn msg_encode_name(var out: SnmpBuf, version: Int, var community: SnmpName, var p: SnmpPdu,
+                   var pool: SnmpBuf) -> Bool []
     if version != SNMP_V1 and version != SNMP_V2C
         return false
     if version == SNMP_V1 and (p.tag == SNMP_PDU_GET_BULK or p.tag == SNMP_PDU_INFORM
@@ -531,7 +533,8 @@ fn trap1_empty() -> SnmpTrap1 []
 // ```
 pub @tier(embedded)
 @no_alloc
-fn trap1_new(var enterprise: SnmpOid, agent_addr: Int, generic: Int, specific: Int, timestamp: Int) -> SnmpTrap1 []
+fn trap1_new(var enterprise: SnmpOid, agent_addr: Int, generic: Int, specific: Int,
+             timestamp: Int) -> SnmpTrap1 []
     SnmpTrap1 { enterprise: enterprise, agent_addr: agent_addr, generic: generic, specific: specific,
                 timestamp: timestamp, binds: pdu_new(SNMP_PDU_TRAP_V1, 0) }
 
@@ -552,7 +555,10 @@ fn read_value(var b: SnmpBuf, at: Int, h: SnmpHead, var vb: SnmpVarbind) -> Int 
         vb.num = n.value
         return if n.ok and n.value >= -2147483648 and n.value <= 2147483647 then snmperr.SNMP_OK else snmperr.SNMP_E_BAD_INTEGER
     if t == snmpber.SNMP_TAG_OCTET_STRING or t == snmpber.SNMP_TAG_OPAQUE
-        vb.kind = if t == snmpber.SNMP_TAG_OPAQUE then SNMP_V_OPAQUE else SNMP_V_OCTETS
+        vb.kind = if t == snmpber.SNMP_TAG_OPAQUE
+            SNMP_V_OPAQUE
+        else
+            SNMP_V_OCTETS
         return snmperr.SNMP_OK
     if t == snmpber.SNMP_TAG_OID
         vb.kind = SNMP_V_OID
@@ -561,11 +567,17 @@ fn read_value(var b: SnmpBuf, at: Int, h: SnmpHead, var vb: SnmpVarbind) -> Int 
         vb.kind = SNMP_V_IPADDRESS
         if h.len != 4
             return snmperr.SNMP_E_BAD_VALUE
-        vb.num = ((b[body] as Int) << 24) | ((b[body + 1] as Int) << 16) | ((b[body + 2] as Int) << 8) | (b[body + 3] as Int)
+        vb.num = (b[body] as Int << 24) | (b[body + 1] as Int << 16) | (b[body + 2] as Int << 8) | b[body + 3] as Int
         return snmperr.SNMP_OK
     if t == snmpber.SNMP_TAG_COUNTER32 or t == snmpber.SNMP_TAG_GAUGE32 or t == snmpber.SNMP_TAG_TIMETICKS
         let n = snmpber.read_unsigned(var b, body, h.len, 32)
-        vb.kind = if t == snmpber.SNMP_TAG_COUNTER32 then SNMP_V_COUNTER32 else (if t == snmpber.SNMP_TAG_GAUGE32 then SNMP_V_GAUGE32 else SNMP_V_TIMETICKS)
+        vb.kind = if t == snmpber.SNMP_TAG_COUNTER32
+            SNMP_V_COUNTER32
+        else
+            if t == snmpber.SNMP_TAG_GAUGE32
+                SNMP_V_GAUGE32
+            else
+                SNMP_V_TIMETICKS
         vb.num = n.value
         return if n.ok then snmperr.SNMP_OK else snmperr.SNMP_E_BAD_INTEGER
     if t == snmpber.SNMP_TAG_COUNTER64
@@ -619,7 +631,8 @@ fn read_varbinds(var b: SnmpBuf, at: Int, limit: Int, var p: SnmpPdu) -> Int []
                 return rc
             match p.vbs.push(vb)
                 Ok(_)  => 0
-                Err(_) => return snmperr.SNMP_E_TOO_MANY_VARBINDS
+                Err(_) =>
+                    return snmperr.SNMP_E_TOO_MANY_VARBINDS
             pos = vend
     snmperr.SNMP_OK
 
@@ -843,8 +856,8 @@ fn trap1_decode(var b: SnmpBuf, info: SnmpMsgInfo, var t: SnmpTrap1) -> Int []
         return ah.code
     if ah.tag != snmpber.SNMP_TAG_IPADDRESS or ah.len != 4
         return snmperr.SNMP_E_BAD_VALUE
-    t.agent_addr = ((b[pos + ah.hdr] as Int) << 24) | ((b[pos + ah.hdr + 1] as Int) << 16)
-        | ((b[pos + ah.hdr + 2] as Int) << 8) | (b[pos + ah.hdr + 3] as Int)
+    t.agent_addr = (b[pos + ah.hdr] as Int << 24) | (b[pos + ah.hdr + 1] as Int << 16)
+        | (b[pos + ah.hdr + 2] as Int << 8) | b[pos + ah.hdr + 3] as Int
     pos = pos + ah.hdr + ah.len
     var r: Vec[Int; 2] = Vec.new()
     var c = read_int32(var b, pos, end, var r)

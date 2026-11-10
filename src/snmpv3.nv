@@ -185,7 +185,12 @@ fn scoped_empty() -> SnmpScoped []
 pub @tier(embedded)
 @no_alloc
 fn layout_empty() -> SnmpV3Layout []
-    SnmpV3Layout { auth_off: 0, auth_len: 0, data_off: 0, body_off: 0, body_len: 0, encrypted: false }
+    SnmpV3Layout { auth_off: 0,
+        auth_len: 0,
+        data_off: 0,
+        body_off: 0,
+        body_len: 0,
+        encrypted: false }
 
 // Read one OCTET STRING of at most `max` octets at `at`, answering its
 // header; `ok` is false for another tag or a longer string.
@@ -196,7 +201,11 @@ fn octets_head(var b: SnmpBuf, at: Int, limit: Int, max: Int) -> SnmpHead []
     if h.ok and h.tag != snmpber.SNMP_TAG_OCTET_STRING
         return SnmpHead { ok: false, tag: h.tag, len: 0, hdr: 0, code: snmperr.SNMP_E_BAD_TAG }
     if h.ok and h.len > max
-        return SnmpHead { ok: false, tag: h.tag, len: h.len, hdr: h.hdr, code: snmperr.SNMP_E_BAD_SECURITY_PARAMS }
+        return SnmpHead { ok: false,
+            tag: h.tag,
+            len: h.len,
+            hdr: h.hdr,
+            code: snmperr.SNMP_E_BAD_SECURITY_PARAMS }
     h
 
 // Read one non-negative INTEGER of 31 bits at `at`: the value and the
@@ -259,17 +268,17 @@ fn put_usm(var out: SnmpBuf, var usm: SnmpUsm) -> Bool []
 //     var out: snmpber.SnmpBuf = Vec.new()
 //     var lay = snmpv3.layout_empty()
 //     let _s = snmpber.put_head(var data, snmpber.SNMP_TAG_SEQUENCE, 0)
-//     println("${snmpv3.v3_encode(var out, h, var u, var data, false, var lay)} ${out.len()}")   // 0 38
+//     println("${snmpv3.v3_encode(var out, h, var u, var data, false, var lay)} ${out.len()}")   // 0 40
 // ```
 pub @tier(embedded)
 @no_alloc
-fn v3_encode(var out: SnmpBuf, h: SnmpV3Header, var usm: SnmpUsm, var data: SnmpBuf, encrypted: Bool,
-             var lay: SnmpV3Layout) -> Int []
+fn v3_encode(var out: SnmpBuf, h: SnmpV3Header, var usm: SnmpUsm, var data: SnmpBuf,
+             encrypted: Bool, var lay: SnmpV3Layout) -> Int []
     if h.msg_id < 0 or h.msg_id > SNMP_BOOTS_MAX or h.max_size < SNMP_MAX_SIZE_MIN or h.max_size > SNMP_BOOTS_MAX
         or h.model < 1 or h.model > SNMP_BOOTS_MAX
         return snmperr.SNMP_E_BAD_ARGUMENT
     let priv = (h.flags & SNMP_FLAG_PRIV) != 0
-    if (priv and (h.flags & SNMP_FLAG_AUTH) == 0) or priv != encrypted or h.flags < 0 or h.flags > 255
+    if priv and (h.flags & SNMP_FLAG_AUTH) == 0 or priv != encrypted or h.flags < 0 or h.flags > 255
         return snmperr.SNMP_E_BAD_FLAGS
     let mark = snmpber.begin(var out)
     var ok = snmpber.put_integer(var out, snmpber.SNMP_TAG_INTEGER, SNMP_V3_VERSION)
@@ -393,7 +402,8 @@ fn v3_decode(var b: SnmpBuf, var h: SnmpV3Header, var usm: SnmpUsm, var lay: Snm
 // the position after them.
 @tier(embedded)
 @no_alloc
-fn read_usm(var b: SnmpBuf, at: Int, var usm: SnmpUsm, var lay: SnmpV3Layout, var r: Vec[Int; 2]) -> Int []
+fn read_usm(var b: SnmpBuf, at: Int, var usm: SnmpUsm, var lay: SnmpV3Layout,
+            var r: Vec[Int; 2]) -> Int []
     let o = snmpber.read_head(var b, at, b.len())
     if not o.ok
         return o.code
@@ -454,7 +464,7 @@ fn read_usm(var b: SnmpBuf, at: Int, var usm: SnmpUsm, var lay: SnmpV3Layout, va
 //     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
 //     var out: snmpber.SnmpBuf = Vec.new()
 //     var pool: snmpber.SnmpBuf = Vec.new()
-//     println("${snmpv3.scoped_encode(var out, var sc, var p, var pool)} ${out.len()}")   // true 18
+//     println("${snmpv3.scoped_encode(var out, var sc, var p, var pool)} ${out.len()}")   // true 19
 // ```
 pub @tier(embedded)
 @no_alloc
@@ -516,7 +526,7 @@ fn scoped_decode(var b: SnmpBuf, at: Int, limit: Int, var sc: SnmpScoped, var p:
 //
 // fn main() [io]
 //     var out: snmpber.SnmpBuf = Vec.new()
-//     println("${snmpv3.discovery_request(var out, 1, 7)} ${out.len()}")   // true 54
+//     println("${snmpv3.discovery_request(var out, 1, 7)} ${out.len()}")   // true 57
 // ```
 pub @tier(embedded)
 @no_alloc
@@ -545,7 +555,8 @@ fn discovery_request(var out: SnmpBuf, msg_id: Int, request_id: Int) -> Bool []
 // ```
 pub @tier(embedded)
 @no_alloc
-fn in_window_authoritative(local_boots: Int, local_time: Int, msg_boots: Int, msg_time: Int) -> Bool []
+fn in_window_authoritative(local_boots: Int, local_time: Int, msg_boots: Int,
+                           msg_time: Int) -> Bool []
     if local_boots == SNMP_BOOTS_MAX or msg_boots != local_boots
         return false
     msg_time >= local_time - SNMP_TIME_WINDOW and msg_time <= local_time + SNMP_TIME_WINDOW
@@ -567,7 +578,7 @@ pub @tier(embedded)
 @no_alloc
 fn in_window_remote(var sync: SnmpEngineSync, now: Int, msg_boots: Int, msg_time: Int) -> Bool []
     var local = now
-    if msg_boots > sync.boots or (msg_boots == sync.boots and msg_time > sync.latest)
+    if msg_boots > sync.boots or msg_boots == sync.boots and msg_time > sync.latest
         sync.boots = msg_boots
         sync.time = msg_time
         sync.latest = msg_time

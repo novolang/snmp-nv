@@ -1,0 +1,107 @@
+// snmptext.nv — object identifiers and values as text, for a program that
+// prints them.
+//
+// This module builds strings, which a microcontroller with no heap does
+// not, so it is one of the package's host modules.  It turns an object
+// identifier into its dotted form and a variable binding's value into the
+// text `snmpwalk` would print for it, without a MIB: a number as a number,
+// an IpAddress as four decimal numbers, an octet string as text when every
+// octet is printable and as hexadecimal otherwise.
+
+use std.str
+use snmpber
+use snmpoid
+use snmppdu
+
+// The dotted form of an identifier, such as `1.3.6.1.2.1.1.1.0`.
+//
+// ```novo
+// use snmpoid
+// use snmptext
+//
+// fn main() [io]
+//     var o = snmpoid.oid_empty()
+//     let _p = snmpoid.oid_parse(var o, ".1.3.6.1.2.1.1.1.0")
+//     println(snmptext.oid_text(var o))   // 1.3.6.1.2.1.1.1.0
+// ```
+pub fn oid_text(var o: SnmpOid) -> Str
+    var parts: [Str] = []
+    for i in 0..snmpoid.oid_len(var o)
+        list.push(parts, str.from_int(snmpoid.oid_arc(var o, i)))
+    str.join(parts, ".")
+
+// An octet as two lower-case hexadecimal digits.
+fn hex2(b: Int) -> Str
+    let digits = "0123456789abcdef"
+    str.slice(digits, b / 16, b / 16 + 1) + str.slice(digits, b % 16, b % 16 + 1)
+
+// The text of the bytes `off` to `off + len` of a buffer: as they are when
+// every one is printable ASCII (32 to 126), and as hexadecimal pairs
+// separated by spaces otherwise.
+fn octets_text(var b: SnmpBuf, off: Int, len: Int) -> Str
+    var printable = true
+    var text = ""
+    var hex: [Str] = []
+    for i in off..off + len
+        let c = b[i] as Int
+        printable = printable and c >= 32 and c <= 126
+        text = text + str.from_byte(c)
+        list.push(hex, hex2(c))
+    if printable
+        return text
+    str.join(hex, " ")
+
+// The text of a variable binding's value.  `b` is the buffer the spans of
+// the binding refer to: the datagram it was read from, or the pool it was
+// written from.
+//
+// An Integer32 and the unsigned kinds are decimal numbers, a Counter64 with
+// the top bit set is shown as its unsigned value, an IpAddress is four
+// numbers separated by dots, TimeTicks are hundredths of a second as a
+// number, an object identifier is dotted, and the three exceptions are
+// named as RFC 3416 names them.
+//
+// ```novo
+// use snmppdu
+// use snmpoid
+// use snmptext
+// use snmpber
+//
+// fn main() [io]
+//     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_RESPONSE, 1)
+//     var o = snmpoid.oid_empty()
+//     let _x = snmpoid.oid_parse(var o, "1.3.6.1.2.1.1.1.0")
+//     let _y = snmppdu.add(var p, var o, snmppdu.SNMP_V_IPADDRESS, 3232235777, 0, 0)
+//     var pool: snmpber.SnmpBuf = Vec.new()
+//     println(snmptext.value_text(var pool, p.vbs[0]))   // 192.168.1.1
+// ```
+pub fn value_text(var b: SnmpBuf, vb: SnmpVarbind) -> Str
+    let k = vb.kind
+    if k == snmppdu.SNMP_V_INTEGER or k == snmppdu.SNMP_V_COUNTER32 or k == snmppdu.SNMP_V_GAUGE32 or k == snmppdu.SNMP_V_TIMETICKS
+        return str.from_int(vb.num)
+    if k == snmppdu.SNMP_V_COUNTER64
+        return unsigned64(vb.num)
+    if k == snmppdu.SNMP_V_IPADDRESS
+        return str.from_int((vb.num >> 24) & 255) + "." + str.from_int((vb.num >> 16) & 255) + "." + str.from_int((vb.num >> 8) & 255) + "." + str.from_int(vb.num & 255)
+    if k == snmppdu.SNMP_V_OCTETS or k == snmppdu.SNMP_V_OPAQUE
+        return octets_text(var b, vb.off, vb.len)
+    if k == snmppdu.SNMP_V_OID
+        var o = snmpoid.oid_empty()
+        if snmpoid.oid_read(var b, vb.off, vb.len, var o) != 0
+            return "(unreadable object identifier)"
+        return oid_text(var o)
+    if k == snmppdu.SNMP_V_NO_SUCH_OBJECT
+        return "noSuchObject"
+    if k == snmppdu.SNMP_V_NO_SUCH_INSTANCE
+        return "noSuchInstance"
+    if k == snmppdu.SNMP_V_END_OF_MIB_VIEW
+        return "endOfMibView"
+    "NULL"
+
+// A 64-bit pattern as the unsigned number it stands for.
+fn unsigned64(v: Int) -> Str
+    if v >= 0
+        return str.from_int(v)
+    let top = (v >>> 1) / 5
+    let low = int.wrapping_sub(v, int.wrapping_mul(top, 10))
+    str.from_int(top) + str.from_int(low)

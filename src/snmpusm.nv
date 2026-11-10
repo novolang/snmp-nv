@@ -1,0 +1,514 @@
+// snmpusm.nv — the User-based Security Model of RFC 3414: the keys, the
+// authentication digest and the two privacy protocols.
+//
+// This module takes and answers `Bytes`, which a microcontroller's runtime
+// does not define, and it uses the hashes of crypto-nv, so it is one of the
+// package's host modules.  The framing it works over, the offsets of the
+// authentication parameters and of the scoped PDU, is `snmpv3`'s.
+//
+// KEYS (RFC 3414 appendix A.2).  A user's password becomes a key in two
+// steps.  The password is repeated to fill 1,048,576 octets and hashed, which
+// is the user's key `Ku` and is the same for every engine.  `Ku`, the
+// engine's ID and `Ku` again are hashed together, which is the localised key
+// `Kul` of one user at one engine (section 2.6).  The hash is MD5 for
+// HMAC-MD5-96, SHA-1 for HMAC-SHA-96, and SHA-256, SHA-384 and SHA-512 for
+// the variants of RFC 7860.  The privacy key is made in the same way from the
+// privacy password with the authentication protocol's hash, and its first 16
+// octets are used.
+//
+// AUTHENTICATION (RFC 3414 section 6, RFC 7860 section 4).  The HMAC of the
+// whole message, computed with the authentication parameters holding zeros,
+// is cut to 12 octets for MD5 and SHA-1, and to 24, 32 and 48 for SHA-256,
+// SHA-384 and SHA-512.  The cut digest is written in place.
+//
+// PRIVACY.  CBC-DES (RFC 3414 section 8): the key is the first 8 octets of
+// the privacy key, and the initialisation vector is its last 8 octets
+// exclusive-ored with the salt.  AES-128 in cipher feedback mode (RFC 3826
+// section 3): the key is the 16 octets and the initialisation vector is the
+// engine's boots, its time and the salt, 4, 4 and 8 octets.  The salt is the
+// message's privacy parameters.
+//
+// NOT IMPLEMENTED: usmHMAC128SHA224AuthProtocol, the SHA-224 variant of RFC
+// 7860, because the hashes this package depends on do not include SHA-224;
+// and AES-192 and AES-256, which are not in RFC 3826 and have several
+// incompatible definitions.
+
+use std.bytes
+use aes
+use aes_core
+use digest
+use hashing
+use snmpdes
+use snmpber
+use snmperr
+use snmpv3
+
+// No authentication.
+pub const USM_AUTH_NONE = 0
+// usmHMACMD5AuthProtocol: HMAC-MD5-96.
+pub const USM_AUTH_MD5 = 1
+// usmHMACSHAAuthProtocol: HMAC-SHA-96.
+pub const USM_AUTH_SHA1 = 2
+// usmHMAC192SHA256AuthProtocol (RFC 7860).  The number 3 is kept for the
+// SHA-224 variant, which is not implemented.
+pub const USM_AUTH_SHA256 = 4
+// usmHMAC256SHA384AuthProtocol (RFC 7860).
+pub const USM_AUTH_SHA384 = 5
+// usmHMAC384SHA512AuthProtocol (RFC 7860).
+pub const USM_AUTH_SHA512 = 6
+
+// No privacy.
+pub const USM_PRIV_NONE = 0
+// usmDESPrivProtocol: CBC-DES.
+pub const USM_PRIV_DES = 1
+// usmAesCfb128Protocol (RFC 3826).
+pub const USM_PRIV_AES128 = 2
+
+// A user's keys at one engine.
+pub struct UsmUser
+    // One of the `USM_AUTH_` values.
+    auth: Int
+    // One of the `USM_PRIV_` values.
+    priv: Int
+    // The localised authentication key: as long as the hash's output.
+    auth_key: Bytes
+    // The localised privacy key: 16 octets.
+    priv_key: Bytes
+
+// The length of the key an authentication protocol uses, which is the
+// output of its hash: 16, 20, 32, 48 or 64.  0 for no protocol.
+//
+// ```novo
+// use snmpusm
+//
+// fn main() [io]
+//     println("${snmpusm.auth_key_len(snmpusm.USM_AUTH_SHA1)}")   // 20
+// ```
+pub fn auth_key_len(proto: Int) -> Int
+    match proto
+        1 => 16
+        2 => 20
+        4 => 32
+        5 => 48
+        6 => 64
+        _ => 0
+
+// The length of the authentication parameters a protocol writes: 12, 12, 24,
+// 32 or 48.  0 for no protocol.
+//
+// ```novo
+// use snmpusm
+//
+// fn main() [io]
+//     println("${snmpusm.auth_params_len(snmpusm.USM_AUTH_SHA256)}")   // 24
+// ```
+pub fn auth_params_len(proto: Int) -> Int
+    match proto
+        1 => 12
+        2 => 12
+        4 => 24
+        5 => 32
+        6 => 48
+        _ => 0
+
+// The hash of a protocol over `data`.
+fn hash_of(proto: Int, data: Bytes) -> Bytes
+    match proto
+        1 => hashing.md5(data)
+        2 => hashing.sha1(data)
+        4 => hashing.sha256(data)
+        5 => hashing.sha384(data)
+        _ => hashing.sha512(data)
+
+// The password repeated to fill `n` octets.
+fn stream_of(password: Str, n: Int) -> Bytes
+    let one = bytes.from_str(password)
+    var parts: [Bytes] = []
+    var have = 0
+    var chunk = bytes.clone(one)
+    while have < n
+        list.push(parts, chunk)
+        have = have + bytes.len(chunk)
+        if bytes.len(chunk) < 65536
+            chunk = bytes.concat([chunk, chunk])
+    bytes.slice(bytes.concat(parts), 0, n)
+
+// The user's key `Ku` from a password: the hash of the password repeated
+// to 1,048,576 octets (RFC 3414 appendix A.2).  Answers an empty `Bytes`
+// for an unknown protocol or an empty password.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+//
+// fn main() [io]
+//     let ku = snmpusm.password_to_key(snmpusm.USM_AUTH_MD5, "maplesyrup")
+//     println(bytes.to_hex(ku))   // 9faf3283884e92834ebc9847d8edd963
+// ```
+pub fn password_to_key(proto: Int, password: Str) -> Bytes
+    if auth_key_len(proto) == 0 or str_empty(password)
+        return bytes.zeros(0)
+    hash_of(proto, stream_of(password, 1048576))
+
+// Whether a string has no bytes.
+fn str_empty(s: Str) -> Bool
+    bytes.len(bytes.from_str(s)) == 0
+
+// The localised key from `Ku` and an engine's ID: the hash of `Ku`, the ID
+// and `Ku` (RFC 3414 section 2.6).
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+//
+// fn main() [io]
+//     let ku = snmpusm.password_to_key(snmpusm.USM_AUTH_SHA1, "maplesyrup")
+//     let id = bytes.from_hex("000000000000000000000002") ?? bytes.zeros(0)
+//     println(bytes.to_hex(snmpusm.localize_key(snmpusm.USM_AUTH_SHA1, ku, id)))   // 6695febc9288e36282235fc7151f128497b38f3f
+// ```
+pub fn localize_key(proto: Int, ku: Bytes, engine_id: Bytes) -> Bytes
+    hash_of(proto, bytes.concat([ku, engine_id, ku]))
+
+// The localised key for a password and an engine ID in one step.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+//
+// fn main() [io]
+//     let id = bytes.from_hex("000000000000000000000002") ?? bytes.zeros(0)
+//     let k = snmpusm.localized_key(snmpusm.USM_AUTH_MD5, "maplesyrup", id)
+//     println(bytes.to_hex(k))   // 526f5eed9fcce26f8964c2930787d82b
+// ```
+pub fn localized_key(proto: Int, password: Str, engine_id: Bytes) -> Bytes
+    let ku = password_to_key(proto, password)
+    if bytes.len(ku) == 0
+        return ku
+    localize_key(proto, ku, engine_id)
+
+// A user's keys at an engine.  The privacy key is made from the privacy
+// password with the authentication protocol's hash and cut to 16 octets.
+// A protocol of `USM_AUTH_NONE` or `USM_PRIV_NONE` leaves its key empty.
+// Privacy without authentication is not a security level (RFC 3412 section
+// 6.4), and answers a user with no privacy.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+//
+// fn main() [io]
+//     let id = bytes.from_hex("000000000000000000000002") ?? bytes.zeros(0)
+//     let u = snmpusm.usm_user(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_AES128, "maplesyrup", "newsyrup", id)
+//     println("${bytes.len(u.auth_key)} ${bytes.len(u.priv_key)}")   // 20 16
+// ```
+pub fn usm_user(auth: Int, priv: Int, auth_password: Str, priv_password: Str,
+                engine_id: Bytes) -> UsmUser
+    let akey = localized_key(auth, auth_password, engine_id)
+    let use_priv = auth_key_len(auth) > 0 and (priv == USM_PRIV_DES or priv == USM_PRIV_AES128)
+    let pkey = if use_priv
+        bytes.slice(localized_key(auth, priv_password, engine_id), 0, 16)
+    else
+        bytes.zeros(0)
+    UsmUser { auth: auth,
+        priv: (if use_priv then priv else USM_PRIV_NONE),
+        auth_key: akey,
+        priv_key: pkey }
+
+// The authentication parameters for a message: the HMAC of `message` under
+// the key, cut to the protocol's length.  `message` is the whole message
+// with the authentication parameters holding zeros.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+//
+// fn main() [io]
+//     let d = snmpusm.digest_of(snmpusm.USM_AUTH_MD5, bytes.from_str("key"), bytes.from_str("message"))
+//     println("${bytes.len(d)}")   // 12
+// ```
+pub fn digest_of(proto: Int, key: Bytes, message: Bytes) -> Bytes
+    var full = bytes.zeros(auth_key_len(proto))
+    full = match proto
+        1 => hashing.hmac_md5(key, message, var full)
+        2 => hashing.hmac_sha1(key, message, var full)
+        4 => hashing.hmac_sha256(key, message, var full)
+        5 => hashing.hmac_sha384(key, message, var full)
+        _ => hashing.hmac_sha512(key, message, var full)
+    bytes.slice(full, 0, auth_params_len(proto))
+
+// The octets of a buffer from `lo` to `hi`.
+fn octets(var b: SnmpBuf, lo: Int, hi: Int) -> Bytes
+    var xs: [Int] = []
+    for i in lo..hi
+        list.push(xs, b[i] as Int)
+    bytes.from_byte_list(xs)
+
+// A buffer holding the octets of a `Bytes`.
+fn buffer_of(x: Bytes) -> SnmpBuf
+    var out: SnmpBuf = Vec.new()
+    for i in 0..bytes.len(x)
+        let _ok = snmpber.put_byte(var out, bytes.byte_at(x, i) ?? 0)
+    out
+
+// The initialisation vector of a privacy protocol: for DES the last 8
+// octets of the privacy key exclusive-ored with the salt, for AES the boots,
+// the time and the salt.
+fn iv_of(priv: Int, key: Bytes, boots: Int, time: Int, salt: Bytes) -> Bytes
+    if priv == USM_PRIV_AES128
+        return bytes.concat([bytes.u32_be(boots), bytes.u32_be(time), salt])
+    var xs: [Int] = []
+    for i in 0..8
+        list.push(xs, (bytes.byte_at(key, 8 + i) ?? 0) ^ (bytes.byte_at(salt, i) ?? 0))
+    bytes.from_byte_list(xs)
+
+// AES-128 in cipher feedback mode with a full block of feedback.  The
+// same function encrypts and decrypts, with `decrypt` saying which octets
+// are fed back.
+fn cfb128(key: Bytes, iv: Bytes, data: Bytes, decrypt: Bool) -> ?Bytes
+    if bytes.len(key) != 16
+        return None
+    let k = aes_core.expand_key_128(bytes.u64_le_at(key, 0) ?? 0, bytes.u64_le_at(key, 8) ?? 0)
+    var feed = bytes.clone(iv)
+    var out: [Int] = []
+    for blk in 0..(bytes.len(data) + 15) / 16
+        let stream = aes.encrypt_block(k, feed) ?? bytes.zeros(16)
+        var cipher: [Int] = []
+        for j in 0..16
+            let i = blk * 16 + j
+            if i < bytes.len(data)
+                let d = bytes.byte_at(data, i) ?? 0
+                let o = d ^ (bytes.byte_at(stream, j) ?? 0)
+                list.push(out, o)
+                list.push(cipher, (if decrypt then d else o))
+        if list.len(cipher) == 16
+            feed = bytes.from_byte_list(cipher)
+    Some(bytes.from_byte_list(out))
+
+// Encrypt `data` under a privacy protocol.  `boots` and `time` are the
+// engine's, and `salt` is the 8 octets that travel as the privacy
+// parameters.  Answers `None` for a key or salt of the wrong length or an
+// unknown protocol.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+//
+// fn main() [io]
+//     let key = bytes.from_hex("2b7e151628aed2a6abf7158809cf4f3c") ?? bytes.zeros(0)
+//     let c = snmpusm.encrypt(snmpusm.USM_PRIV_AES128, key, 0, 0, bytes.zeros(8), bytes.from_str("hello")) ?? bytes.zeros(0)
+//     println("${bytes.len(c)}")   // 5
+// ```
+pub fn encrypt(priv: Int, key: Bytes, boots: Int, time: Int, salt: Bytes, data: Bytes) -> ?Bytes
+    if bytes.len(salt) != 8
+        return None
+    if priv == USM_PRIV_AES128
+        return cfb128(key, iv_of(priv, key, boots, time, salt), data, false)
+    if priv == USM_PRIV_DES and bytes.len(key) == 16
+        return snmpdes.cbc_encrypt(bytes.slice(key, 0, 8), iv_of(priv, key, boots, time, salt), data)
+    None
+
+// Decrypt `data` under a privacy protocol.  The arguments are those of
+// `encrypt`.  The data of DES must be a multiple of 8 octets.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+//
+// fn main() [io]
+//     let key = bytes.from_hex("2b7e151628aed2a6abf7158809cf4f3c") ?? bytes.zeros(0)
+//     let salt = bytes.from_hex("0102030405060708") ?? bytes.zeros(0)
+//     let c = snmpusm.encrypt(snmpusm.USM_PRIV_AES128, key, 7, 9, salt, bytes.from_str("hello")) ?? bytes.zeros(0)
+//     let p = snmpusm.decrypt(snmpusm.USM_PRIV_AES128, key, 7, 9, salt, c) ?? bytes.zeros(0)
+//     println(bytes.to_str(p))   // hello
+// ```
+pub fn decrypt(priv: Int, key: Bytes, boots: Int, time: Int, salt: Bytes, data: Bytes) -> ?Bytes
+    if bytes.len(salt) != 8
+        return None
+    if priv == USM_PRIV_AES128
+        return cfb128(key, iv_of(priv, key, boots, time, salt), data, true)
+    if priv == USM_PRIV_DES and bytes.len(key) == 16
+        return snmpdes.cbc_decrypt(bytes.slice(key, 0, 8), iv_of(priv, key, boots, time, salt), data)
+    None
+
+// The salt for a message: for DES the engine's boots and a counter, 4
+// octets each (RFC 3414 section 8.1.1.1); for AES a 64-bit counter
+// (RFC 3826 section 3.1.2.1).  The counter is the caller's, incremented for
+// every message.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+//
+// fn main() [io]
+//     println(bytes.to_hex(snmpusm.salt_of(snmpusm.USM_PRIV_DES, 5, 258)))   // 0000000500000102
+// ```
+pub fn salt_of(priv: Int, boots: Int, counter: Int) -> Bytes
+    if priv == USM_PRIV_AES128
+        return bytes.u64_be(counter)
+    bytes.concat([bytes.u32_be(boots), bytes.u32_be(counter)])
+
+// The message with its authentication parameters holding zeros.
+fn zeroed(var msg: SnmpBuf, lay: SnmpV3Layout) -> Bytes
+    var xs: [Int] = []
+    for i in 0..msg.len()
+        let inside = i >= lay.auth_off and i < lay.auth_off + lay.auth_len
+        list.push(xs, (if inside then 0 else msg[i] as Int))
+    bytes.from_byte_list(xs)
+
+// Encrypt the scoped PDU of a message, set the privacy flag and the privacy
+// parameters, and write the new message over `msg`.  `h`, `u` and `lay` are
+// what `v3_decode` read from it; `lay` is replaced by the new layout.
+fn encrypt_message(var msg: SnmpBuf, user: UsmUser, salt: Int, h: SnmpV3Header, u: SnmpUsm,
+                   lay: SnmpV3Layout, var out_lay: SnmpV3Layout) -> Int
+    let s = salt_of(user.priv, u.boots, salt)
+    let plain = octets(var msg, lay.data_off, msg.len())
+    let cipher = encrypt(user.priv, user.priv_key, u.boots, u.time, s, plain) ?? bytes.zeros(0)
+    if bytes.len(cipher) == 0
+        return snmperr.SNMP_E_BAD_ARGUMENT
+    var u2 = SnmpUsm { engine_id: u.engine_id, boots: u.boots, time: u.time, user: u.user,
+                       auth_params: u.auth_params, priv_params: Vec.new() }
+    for i in 0..8
+        let _ok = u2.priv_params.push(bytes.byte_at(s, i) ?? 0)
+    let h2 = SnmpV3Header { msg_id: h.msg_id, max_size: h.max_size, flags: h.flags | snmpv3.SNMP_FLAG_PRIV,
+                            model: h.model }
+    var data = buffer_of(cipher)
+    var out: SnmpBuf = Vec.new()
+    let e = snmpv3.v3_encode(var out, h2, var u2, var data, true, var out_lay)
+    if e == snmperr.SNMP_OK
+        msg = out
+    e
+
+// Protect a message a session built: encrypt it when the user has a privacy
+// protocol, and write the authentication digest when it has an
+// authentication protocol.  `msg` is a v3 message with its scoped PDU in the
+// clear and, for authentication, the authentication parameters holding
+// zeros of the protocol's length.  `salt` is a counter, different for every
+// message the user sends.
+//
+// Answers `SNMP_OK`; `SNMP_E_BAD_FLAGS` for a message whose flags do not
+// agree with the user's security level; `SNMP_E_BAD_ARGUMENT` when the
+// authentication parameters are not the protocol's length or a key is
+// missing; and the faults of `v3_decode`.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+// use snmpv3
+// use snmpber
+//
+// fn main() [io]
+//     let id = bytes.from_hex("80000002010984030100") ?? bytes.zeros(0)
+//     let user = snmpusm.usm_user(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_NONE, "maplesyrup", "", id)
+//     var msg: snmpber.SnmpBuf = Vec.new()
+//     let _d = snmpv3.discovery_request(var msg, 1, 1)
+//     println("${snmpusm.protect(var msg, user, 1)}")   // 13
+// ```
+pub fn protect(var msg: SnmpBuf, user: UsmUser, salt: Int) -> Int
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    let c = snmpv3.v3_decode(var msg, var h, var u, var lay)
+    if c != snmperr.SNMP_OK
+        return c
+    let authed = (h.flags & snmpv3.SNMP_FLAG_AUTH) != 0
+    if authed != (user.auth != USM_AUTH_NONE) or lay.encrypted
+        return snmperr.SNMP_E_BAD_FLAGS
+    var now = lay
+    if user.priv != USM_PRIV_NONE
+        let e = encrypt_message(var msg, user, salt, h, u, lay, var now)
+        if e != snmperr.SNMP_OK
+            return e
+    if not authed
+        return snmperr.SNMP_OK
+    let lay = now
+    if lay.auth_len != auth_params_len(user.auth) or bytes.len(user.auth_key) == 0
+        return snmperr.SNMP_E_BAD_ARGUMENT
+    let d = digest_of(user.auth, user.auth_key, zeroed(var msg, lay))
+    for i in 0..lay.auth_len
+        msg[lay.auth_off + i] = (bytes.byte_at(d, i) ?? 0) as u8
+    snmperr.SNMP_OK
+
+// Check that the authentication digest of a message is the one its key
+// makes.  The comparison takes the same time wherever the digests differ.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+// use snmpv3
+// use snmpber
+//
+// fn main() [io]
+//     let id = bytes.from_hex("80000002010984030100") ?? bytes.zeros(0)
+//     let user = snmpusm.usm_user(snmpusm.USM_AUTH_SHA1, snmpusm.USM_PRIV_NONE, "maplesyrup", "", id)
+//     var msg: snmpber.SnmpBuf = Vec.new()
+//     let _d = snmpv3.discovery_request(var msg, 1, 1)
+//     println("${snmpusm.verify(var msg, user)}")   // false
+// ```
+pub fn verify(var msg: SnmpBuf, user: UsmUser) -> Bool
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    if snmpv3.v3_decode(var msg, var h, var u, var lay) != snmperr.SNMP_OK
+        return false
+    if lay.auth_len != auth_params_len(user.auth) or bytes.len(user.auth_key) == 0
+        return false
+    let want = digest_of(user.auth, user.auth_key, zeroed(var msg, lay))
+    digest.ct_eq(want, octets(var msg, lay.auth_off, lay.auth_off + lay.auth_len))
+
+// Open a message that arrived: check its authentication digest when the
+// authentication flag is set, decrypt it when the privacy flag is set, and
+// write the message back over `msg` with the scoped PDU in the clear and the
+// privacy flag cleared, in the form a session reads.
+//
+// Answers `SNMP_OK`; `SNMP_E_WRONG_DIGEST` when the digest does not match;
+// `SNMP_E_BAD_FLAGS` when the flags ask for a level the user does not have;
+// `SNMP_E_DECRYPT` when what decrypts is not a scoped PDU; and the faults of
+// `v3_decode`.
+//
+// ```novo
+// use std.bytes
+// use snmpusm
+// use snmpv3
+// use snmpber
+//
+// fn main() [io]
+//     let id = bytes.from_hex("80000002010984030100") ?? bytes.zeros(0)
+//     let user = snmpusm.usm_user(snmpusm.USM_AUTH_NONE, snmpusm.USM_PRIV_NONE, "", "", id)
+//     var msg: snmpber.SnmpBuf = Vec.new()
+//     let _d = snmpv3.discovery_request(var msg, 1, 1)
+//     println("${snmpusm.unprotect(var msg, user)}")   // 0
+// ```
+pub fn unprotect(var msg: SnmpBuf, user: UsmUser) -> Int
+    var h = snmpv3.header_empty()
+    var u = snmpv3.usm_empty()
+    var lay = snmpv3.layout_empty()
+    let c = snmpv3.v3_decode(var msg, var h, var u, var lay)
+    if c != snmperr.SNMP_OK
+        return c
+    let authed = (h.flags & snmpv3.SNMP_FLAG_AUTH) != 0
+    let private = (h.flags & snmpv3.SNMP_FLAG_PRIV) != 0
+    if authed != (user.auth != USM_AUTH_NONE) or private != (user.priv != USM_PRIV_NONE)
+        return snmperr.SNMP_E_BAD_FLAGS
+    if authed and not verify(var msg, user)
+        return snmperr.SNMP_E_WRONG_DIGEST
+    if not private
+        return snmperr.SNMP_OK
+    if u.priv_params.len() != 8
+        return snmperr.SNMP_E_BAD_SECURITY_PARAMS
+    var salt: [Int] = []
+    for i in 0..8
+        list.push(salt, u.priv_params[i] as Int)
+    let cipher = octets(var msg, lay.body_off, lay.body_off + lay.body_len)
+    let plain = decrypt(user.priv, user.priv_key, u.boots, u.time, bytes.from_byte_list(salt), cipher) ?? bytes.zeros(0)
+    var data = buffer_of(plain)
+    let sh = snmpber.read_head(var data, 0, data.len())
+    if not sh.ok or sh.tag != snmpber.SNMP_TAG_SEQUENCE
+        return snmperr.SNMP_E_DECRYPT
+    var trimmed = buffer_of(bytes.slice(plain, 0, sh.hdr + sh.len))
+    let h2 = SnmpV3Header { msg_id: h.msg_id, max_size: h.max_size, flags: h.flags & 5, model: h.model }
+    var out: SnmpBuf = Vec.new()
+    var lay2 = snmpv3.layout_empty()
+    let e = snmpv3.v3_encode(var out, h2, var u, var trimmed, false, var lay2)
+    if e == snmperr.SNMP_OK
+        msg = out
+    e

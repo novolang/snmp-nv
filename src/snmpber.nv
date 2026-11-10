@@ -211,7 +211,7 @@ fn put_unsigned(var b: SnmpBuf, tag: Int, v: Int) -> Bool []
     var ok = put_head(var b, tag, n)
     for k in 0..n
         let shift = 8 * (n - 1 - k)
-        ok = ok and put_byte(var b, if shift >= 64 then 0 else v >>> shift)
+        ok = ok and put_byte(var b, (if shift >= 64 then 0 else v >>> shift))
     ok
 
 // Append an OCTET STRING-like value with the given tag whose contents are
@@ -373,9 +373,12 @@ pub @tier(embedded)
 fn read_integer(var b: SnmpBuf, at: Int, len: Int) -> SnmpNum []
     if len < 1 or len > 8 or at < 0 or at + len > b.len()
         return SnmpNum { ok: false, value: 0 }
-    var v = if (b[at] as Int) >= 128 then -1 else 0
+    var v = if (b[at] as Int) >= 128
+        -1
+    else
+        0
     for i in 0..len
-        v = (v << 8) | (b[at + i] as Int)
+        v = (v << 8) | b[at + i] as Int
     SnmpNum { ok: true, value: v }
 
 // Read `len` bytes at `at` as an unsigned integer whose largest value is
@@ -399,10 +402,10 @@ fn read_unsigned(var b: SnmpBuf, at: Int, len: Int, bits: Int) -> SnmpNum []
         return SnmpNum { ok: false, value: 0 }
     var v = 0
     for i in 0..len
-        v = (v << 8) | (b[at + i] as Int)
+        v = (v << 8) | b[at + i] as Int
     let first = b[at] as Int
     let wide = len == 9 and first != 0
-    let long32 = bits == 32 and (len > 5 or (len == 5 and first != 0))
+    let long32 = bits == 32 and (len > 5 or len == 5 and first != 0)
     SnmpNum { ok: not wide and not long32, value: v }
 
 // Replace the contents of a name with the bytes of a string.  Answers
@@ -419,14 +422,10 @@ pub @tier(embedded)
 @no_alloc
 fn name_set(var n: SnmpName, s: Str) -> Bool []
     n.clear()
-    var ok = str.len(s) <= SNMP_NAME_MAX
+    let ok = str.len(s) <= SNMP_NAME_MAX
     for i in 0..str.len(s)
         if ok
-            match n.push(str.byte_at_or(s, i, 0) as u8)
-                Ok(_)  => 0
-                Err(_) => ok = false
-    if not ok
-        n.clear()
+            let _pushed = n.push(str.byte_at_or(s, i, 0) as u8)
     ok
 
 // Append an OCTET STRING whose contents are a name.

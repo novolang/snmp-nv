@@ -243,7 +243,8 @@ fn bytes_in(var b: snmpber.SnmpBuf, xs: [Int])
 @test
 fn test_reading_integers() [io]
     var b: snmpber.SnmpBuf = Vec.new()
-    bytes_in(var b, [0xFF, 0x7F, 0x00, 0x80, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    bytes_in(var b,
+        [0xFF, 0x7F, 0x00, 0x80, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
     test.case("signed, with the sign extended")
     test.assert_eq(snmpber.read_integer(var b, 0, 2).value, -129)
     test.assert_eq(snmpber.read_integer(var b, 2, 2).value, 128)
@@ -258,7 +259,30 @@ fn test_reading_integers() [io]
 
     test.case("unsigned 32 bits")
     var u: snmpber.SnmpBuf = Vec.new()
-    bytes_in(var u, [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+    bytes_in(var u, [0x00,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0x80,
+        0x00,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF])
     test.assert_eq(snmpber.read_unsigned(var u, 0, 5, 32).value, 4294967295)
     test.assert(snmpber.read_unsigned(var u, 0, 5, 32).ok)
     test.case("a leading octet with the top bit set and no zero before it reads as positive")
@@ -294,7 +318,16 @@ fn test_object_identifier_text() [io]
     test.assert_eq(snmpoid.oid_arc(var o, 2), -1)
     test.assert_eq(snmpoid.oid_arc(var o, -1), -1)
     test.case("texts that are not identifiers leave it empty")
-    for bad in ["1.3.", ".", "..1", "1..3", "1.x", "1.4294967296", "-1", "1.00000000000", "1 3", "1.3.6.1.2.1.1.1.0.1.2.3.4.5.6.7.8.9.1.2.3.4.5.6.7"]
+    for bad in ["1.3.",
+    ".",
+    "..1",
+    "1..3",
+    "1.x",
+    "1.4294967296",
+    "-1",
+    "1.00000000000",
+    "1 3",
+    "1.3.6.1.2.1.1.1.0.1.2.3.4.5.6.7.8.9.1.2.3.4.5.6.7"]
         test.assert(not snmpoid.oid_parse(var o, bad))
         test.assert_eq(snmpoid.oid_len(var o), 0)
     test.case("the most arcs that fit")
@@ -420,6 +453,10 @@ fn test_reading_object_identifiers() [io]
     var g: snmpber.SnmpBuf = Vec.new()
     bytes_in(var g, [0x2B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F])
     test.assert_eq(snmpoid.oid_read(var g, 0, 12, var r), snmperr.SNMP_E_BAD_OID)
+    test.case("a first octet pair whose second arc is over 32 bits")
+    var f2: snmpber.SnmpBuf = Vec.new()
+    bytes_in(var f2, [0x82, 0x80, 0x80, 0x80, 0x80, 0x00])
+    test.assert_eq(snmpoid.oid_read(var f2, 0, 6, var r), snmperr.SNMP_E_BAD_OID)
     test.case("more arcs than an identifier holds")
     var h: snmpber.SnmpBuf = Vec.new()
     bytes_in(var h, [0x2B])

@@ -159,7 +159,10 @@ fn oid_parse(var o: SnmpOid, text: Str) -> Bool []
 pub @tier(embedded)
 @no_alloc
 fn oid_compare(var a: SnmpOid, var b: SnmpOid) -> Int []
-    let n = if a.arcs.len() < b.arcs.len() then a.arcs.len() else b.arcs.len()
+    let n = if a.arcs.len() < b.arcs.len()
+        a.arcs.len()
+    else
+        b.arcs.len()
     for i in 0..n
         let x = a.arcs[i] as Int
         let y = b.arcs[i] as Int
@@ -225,7 +228,7 @@ fn packed_head(var o: SnmpOid) -> Int []
         return -1
     let first = o.arcs[0] as Int
     let second = o.arcs[1] as Int
-    if first > 2 or (first < 2 and second > 39)
+    if first > 2 or first < 2 and second > 39
         return -1
     asn1tag.pack_arcs(first, second)
 
