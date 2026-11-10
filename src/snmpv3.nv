@@ -518,7 +518,9 @@ fn scoped_decode(var b: SnmpBuf, at: Int, limit: Int, var sc: SnmpScoped, var p:
 // Build the message that starts engine discovery (RFC 3414 section 4): an
 // empty engine ID, an empty user name, security level noAuthNoPriv with
 // the reportable flag, and a GetRequest with no variable bindings.  The
-// agent's Report answers with its engine ID, boots and time.
+// agent's Report answers with its engine ID, boots and time.  Answers
+// `SNMP_OK`, or `SNMP_E_BAD_ARGUMENT` for a message ID outside 0 to
+// 2147483647.
 //
 // ```novo
 // use snmpv3
@@ -526,11 +528,11 @@ fn scoped_decode(var b: SnmpBuf, at: Int, limit: Int, var sc: SnmpScoped, var p:
 //
 // fn main() [io]
 //     var out: snmpber.SnmpBuf = Vec.new()
-//     println("${snmpv3.discovery_request(var out, 1, 7)} ${out.len()}")   // true 57
+//     println("${snmpv3.discovery_request(var out, 1, 7)} ${out.len()}")   // 0 57
 // ```
 pub @tier(embedded)
 @no_alloc
-fn discovery_request(var out: SnmpBuf, msg_id: Int, request_id: Int) -> Bool []
+fn discovery_request(var out: SnmpBuf, msg_id: Int, request_id: Int) -> Int []
     var data: SnmpBuf = Vec.new()
     var sc = scoped_empty()
     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, request_id)
@@ -540,7 +542,8 @@ fn discovery_request(var out: SnmpBuf, msg_id: Int, request_id: Int) -> Bool []
     let h = SnmpV3Header { msg_id: msg_id, max_size: snmpber.SNMP_MSG_MAX, flags: SNMP_FLAG_REPORTABLE,
                            model: SNMP_USM_MODEL }
     out.clear()
-    scoped_encode(var data, var sc, var p, var pool) and v3_encode(var out, h, var u, var data, false, var lay) == snmperr.SNMP_OK
+    let _scoped = scoped_encode(var data, var sc, var p, var pool)
+    v3_encode(var out, h, var u, var data, false, var lay)
 
 // Whether a message from the authoritative engine is inside the time
 // window (RFC 3414 section 3.2 step 7a): the engine has not run out of

@@ -163,7 +163,7 @@ fn trap_check() -> Int []
 @no_alloc
 fn v3_check() -> Int []
     var out: SnmpBuf = Vec.new()
-    if not snmpv3.discovery_request(var out, 1, 7) or out.len() != 57
+    if snmpv3.discovery_request(var out, 1, 7) != snmperr.SNMP_OK or out.len() != 57
         return 0
     var h = snmpv3.header_empty()
     var u = snmpv3.usm_empty()

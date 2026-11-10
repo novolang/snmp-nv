@@ -664,6 +664,23 @@ fn test_a_v3_response_outside_the_time_window() [io]
     test.assert(snmpsession.is_idle(s))
 
 @test
+fn test_message_ids_wrap() [io]
+    var s = snmpsession.session_v3("bert", 0, 0, 2147483647)
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpsession.discover(var s, var out), snmperr.SNMP_OK)
+    test.assert_eq(s.msg_id, 1)
+    var p = get_pdu(snmppdu.SNMP_PDU_GET, "1.3.6.1.2.1.1.1.0")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    let _t1 = snmpsession.tick(var s, 100000)
+    let _t2 = snmpsession.tick(var s, 100000)
+    let _t3 = snmpsession.tick(var s, 100000)
+    test.assert_eq(snmpsession.request(var s, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(s.msg_id, 2)
+    var t = snmpsession.session_v3("bert", 0, 0, 2147483647)
+    test.assert_eq(snmpsession.request(var t, var p, var pool, var out), snmperr.SNMP_OK)
+    test.assert_eq(t.msg_id, 1)
+
+@test
 fn test_a_v3_request_that_cannot_be_written() [io]
     var s = snmpsession.session_v3("bert", 0, 0, 100)
     var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_SET, 0)

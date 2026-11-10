@@ -493,6 +493,24 @@ fn test_a_v1_message_cannot_carry_a_v2_pdu() [io]
     test.assert(not snmppdu.msg_encode(var out, snmppdu.SNMP_V2C, "0123456789012345678901234567890123", var p2, var pool))
 
 @test
+fn test_a_community_held_as_a_name() [io]
+    var p = snmppdu.pdu_new(snmppdu.SNMP_PDU_GET, 1)
+    var o = oid_of("1.3.6.1.2.1.1.1.0")
+    let _a = snmppdu.add_null(var p, var o)
+    var name: snmpber.SnmpName = Vec.new()
+    let _b = snmpber.name_set(var name, "public")
+    var pool: snmpber.SnmpBuf = Vec.new()
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert(snmppdu.msg_encode_name(var out, snmppdu.SNMP_V2C, var name, var p, var pool))
+    var want = get_request(snmppdu.SNMP_V2C)
+    test.assert_eq(out.len(), want.len())
+    var same = true
+    for i in 0..out.len()
+        same = same and out[i] == want[i]
+    test.assert(same)
+    test.assert(not snmppdu.msg_encode_name(var out, 3, var name, var p, var pool))
+
+@test
 fn test_the_v1_trap_byte_by_byte() [io]
     // enterprise 1.3.6.1.4.1.9: 06 06 2B 06 01 04 01 09 (8); agent address
     // 10.0.0.1: 40 04 0A 00 00 01 (6); generic 6, specific 1: 02 01 06 and

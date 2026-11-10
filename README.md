@@ -192,10 +192,10 @@ asserted. Under QEMU it prints `PASS: snmp-embedded`.
 novo build --target=nrf52-qemu tests/embedded_probe.nv
 ```
 
-The image is 45,196 bytes of flash and 520 bytes of static RAM, and that
-includes the runtime and the board's startup code. Of the flash, 30,996 bytes
+The image is 45,164 bytes of flash and 520 bytes of static RAM, and that
+includes the runtime and the board's startup code. Of the flash, 30,972 bytes
 are the program (the six modules and the probe), 5,602 the runtime, 4,564
-libgcc and 4,034 tables and constants. The sizes of the values the probe
+libgcc and 4,026 tables and constants. The sizes of the values the probe
 holds in its frame are:
 
 | Value | Bytes |

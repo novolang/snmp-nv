@@ -212,6 +212,7 @@ fn test_aes_cfb_of_rfc_3826() [io]
     test.assert(snmpusm.decrypt(snmpusm.USM_PRIV_DES, hex("00"), 0, 0, salt, plain) == None)
     test.assert(snmpusm.encrypt(9, key, 0, 0, salt, plain) == None)
     test.assert(snmpusm.decrypt(snmpusm.USM_PRIV_AES128, hex("00"), 0, 0, salt, plain) == None)
+    test.assert(snmpusm.decrypt(snmpusm.USM_PRIV_AES128, key, 0, 0, hex("00"), plain) == None)
     test.assert(snmpusm.decrypt(9, key, 0, 0, salt, plain) == None)
 
 // A request a v3 session built at the given level, for the engine "engine".

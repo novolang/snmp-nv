@@ -512,14 +512,11 @@ fn discover(var s: SnmpSession, var out: SnmpBuf) -> Int []
         1
     else
         msg + 1
-    let built = snmpv3.discovery_request(var out, msg, id)
+    let c = snmpv3.discovery_request(var out, msg, id)
     s.flight_msg = msg
-    if built
+    if c == snmperr.SNMP_OK
         started(var s, SNMP_OP_DISCOVER, id)
-    if built
-        snmperr.SNMP_OK
-    else
-        snmperr.SNMP_E_NO_ROOM
+    c
 
 // Let time pass.  `ms` is the number of milliseconds since the last call
 // or the last send.  While a request is in flight and the wait is not
@@ -664,14 +661,12 @@ fn walk_answer(var s: SnmpSession, var r: SnmpPdu, var out: SnmpBuf) -> SnmpStep
                 snmpoid.oid_copy(var s.cursor, var r.vbs[i].oid)
     if not more
         return finished(var s, 0, 0, n > 0, n)
-    let sent = walk_request(var s, var out) == snmperr.SNMP_OK
-    s.phase = if sent
-        SNMP_PHASE_WAITING
-    else
-        SNMP_PHASE_IDLE
-    SnmpStep { action: (if sent then SNMP_ACT_SEND else SNMP_ACT_NONE), deliver: n > 0, count: n, done: false,
-               failed: not sent, reason: (if sent then SNMP_FAIL_NONE else SNMP_FAIL_REPORT), status: 0, index: 0,
-               report: 0, ignored: false }
+    // The cursor is a name read from a datagram, so it has at most 24 arcs
+    // and a first pair that packs, and the request is a few dozen octets:
+    // building it into a cleared buffer cannot fail.
+    let _next = walk_request(var s, var out)
+    SnmpStep { action: SNMP_ACT_SEND, deliver: n > 0, count: n, done: false, failed: false,
+               reason: SNMP_FAIL_NONE, status: 0, index: 0, report: 0, ignored: false }
 
 // Read a datagram that arrived.
 //

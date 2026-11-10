@@ -84,7 +84,7 @@ fn test_engine_discovery_request_byte_by_byte() [io]
     // 02 01 00, 30 00 } } (19).  The message holds 3 + 15 + 18 + 19 = 55,
     // 30 37.
     var out: snmpber.SnmpBuf = Vec.new()
-    test.assert(snmpv3.discovery_request(var out, 1, 7))
+    test.assert_eq(snmpv3.discovery_request(var out, 1, 7), snmperr.SNMP_OK)
     test.assert_eq(diff(var out, [0x30, 0x37, 0x02, 0x01, 0x03,
                                   0x30, 0x0D, 0x02, 0x01, 0x01, 0x02, 0x02, 0x05, 0xC0, 0x04, 0x01, 0x04, 0x02, 0x01, 0x03,
                                   0x04, 0x10, 0x30, 0x0E, 0x04, 0x00, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
@@ -92,6 +92,11 @@ fn test_engine_discovery_request_byte_by_byte() [io]
                                   0x30, 0x11, 0x04, 0x00, 0x04, 0x00, 0xA0, 0x0B, 0x02, 0x01, 0x07,
                                   0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]),
                                   -1)
+
+@test
+fn test_a_discovery_request_with_a_bad_message_id() [io]
+    var out: snmpber.SnmpBuf = Vec.new()
+    test.assert_eq(snmpv3.discovery_request(var out, -1, 7), snmperr.SNMP_E_BAD_ARGUMENT)
 
 @test
 fn test_the_usm_sample_byte_by_byte() [io]

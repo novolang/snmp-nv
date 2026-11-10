@@ -35,7 +35,7 @@ The first release.
   modules.
 - **`tests/embedded_probe.nv`**, a firmware program that runs six checks
   and is built for `--target=nrf52-qemu`. It prints `PASS: snmp-embedded`
-  under QEMU. The image is 45,196 bytes of flash and 520 bytes of static RAM.
+  under QEMU. The image is 45,164 bytes of flash and 520 bytes of static RAM.
 - Six test suites, with the vectors of RFC 3414 appendix A.3 and A.5.2,
   X.690, FIPS 81 and NIST SP 800-38A, and byte-by-byte messages worked out
   by hand.
